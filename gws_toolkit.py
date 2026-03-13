@@ -4,7 +4,7 @@ author: Adam Smith
 author_url: https://adamsmith.as
 description: Per-user OAuth2 access to Google Drive (read-only). Self-registers an OAuth callback endpoint.
 required_open_webui_version: 0.4.0
-version: 0.3.2
+version: 0.3.3
 licence: MIT
 requirements: httpx
 """
@@ -22,7 +22,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.3.2"
+TOOL_VERSION = "0.3.3"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -253,6 +253,33 @@ def _clear_tokens(app, user_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Tool preamble helpers (module-level so OWUI doesn't expose them as tools)
+# ---------------------------------------------------------------------------
+
+
+def _setup(app, valves):
+    """Lazy route registration, called once per tool invocation."""
+    if valves.google_client_id and valves.google_client_secret:
+        _ensure_routes(
+            app, valves.google_client_id,
+            valves.google_client_secret, valves.base_url)
+
+
+async def _authed(valves, __user__, __request__) -> tuple:
+    """
+    Common preamble: ensure routes, resolve token.
+    Returns (app, user_id, token_or_none).
+    """
+    app = __request__.app
+    _setup(app, valves)
+    user_id = __user__["id"]
+    token = await _get_token(
+        app, user_id,
+        valves.google_client_id, valves.google_client_secret)
+    return app, user_id, token
+
+
+# ---------------------------------------------------------------------------
 # The Tool
 # ---------------------------------------------------------------------------
 
@@ -273,26 +300,6 @@ class Tools:
         self.valves = self.Valves()
         self.citation = True
 
-    def _setup(self, app):
-        """Lazy route registration, called once per tool invocation."""
-        if self.valves.google_client_id and self.valves.google_client_secret:
-            _ensure_routes(
-                app, self.valves.google_client_id,
-                self.valves.google_client_secret, self.valves.base_url)
-
-    async def _authed(self, __user__, __request__) -> tuple:
-        """
-        Common preamble: ensure routes, resolve token.
-        Returns (app, user_id, token_or_none).
-        """
-        app = __request__.app
-        self._setup(app)
-        user_id = __user__["id"]
-        token = await _get_token(
-            app, user_id,
-            self.valves.google_client_id, self.valves.google_client_secret)
-        return app, user_id, token
-
     # -------------------------------------------------------------------
     # Tool methods
     # -------------------------------------------------------------------
@@ -308,7 +315,7 @@ class Tools:
         if not __request__:
             return "ERROR: No request context."
 
-        app, user_id, token = await self._authed(__user__, __request__)
+        app, user_id, token = await _authed(self.valves, __user__, __request__)
 
         if not self.valves.google_client_id:
             return "ERROR: Tool not configured. Admin must set OAuth client ID and secret."
@@ -349,7 +356,7 @@ class Tools:
         if not __request__:
             return "ERROR: No request context."
 
-        app, user_id, token = await self._authed(__user__, __request__)
+        app, user_id, token = await _authed(self.valves, __user__, __request__)
         if not token:
             return "NOT_CONNECTED: Call connect_google_workspace first."
 
@@ -394,7 +401,7 @@ class Tools:
         if not __request__:
             return "ERROR: No request context."
 
-        app, user_id, token = await self._authed(__user__, __request__)
+        app, user_id, token = await _authed(self.valves, __user__, __request__)
         if not token:
             return "NOT_CONNECTED: Call connect_google_workspace first."
 
@@ -454,7 +461,7 @@ class Tools:
         if not __request__:
             return "ERROR: No request context."
 
-        app, user_id, token = await self._authed(__user__, __request__)
+        app, user_id, token = await _authed(self.valves, __user__, __request__)
         if not token:
             return "NOT_CONNECTED: Call connect_google_workspace first."
 
