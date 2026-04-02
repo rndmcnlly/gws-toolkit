@@ -121,90 +121,20 @@ def _caps_from_scopes(scope_str: str) -> set:
 # ---------------------------------------------------------------------------
 # Action registry
 #
-# Each action maps to: (required_capability, handler_function_name, description)
-# Handler functions are defined below and looked up by name at dispatch time.
-# Action names mirror the Google API resource paths:
-#   {service}.{resource}.{verb}
+# Populated by @action decorators on handler functions below.
+# Each entry maps action_name -> (required_capability, handler_fn, description)
+# Action names mirror the Google API resource paths: {service}.{resource}.{verb}
 # ---------------------------------------------------------------------------
 
-ACTIONS = {
-    # --- Drive (readonly) ---
-    "drive.files.search": (
-        "drive.readonly",
-        "_action_drive_search",
-        "Search Drive files. Params: query (str, required)",
-    ),
-    "drive.files.get": (
-        "drive.readonly",
-        "_action_drive_read",
-        "Read a Drive file (exports Docs as markdown, Sheets as CSV, Slides as text). Params: fileId (str, required)",
-    ),
-    "drive.files.list": (
-        "drive.readonly",
-        "_action_drive_list",
-        "List files in a Drive folder. Params: folderId (str, default 'root')",
-    ),
-    # --- Gmail (readonly) ---
-    "gmail.messages.search": (
-        "gmail.readonly",
-        "_action_gmail_messages_search",
-        "Search Gmail messages (uses Gmail search syntax: from:, subject:, after:, etc.). Params: query (str), maxResults (int, default 10)",
-    ),
-    "gmail.messages.get": (
-        "gmail.readonly",
-        "_action_gmail_messages_get",
-        "Read a single Gmail message with decoded body. Params: messageId (str, required)",
-    ),
-    "gmail.threads.list": (
-        "gmail.readonly",
-        "_action_gmail_threads_list",
-        "Search Gmail threads. Params: query (str), maxResults (int, default 10)",
-    ),
-    "gmail.threads.get": (
-        "gmail.readonly",
-        "_action_gmail_threads_get",
-        "Read all messages in a Gmail thread. Params: threadId (str, required)",
-    ),
-    # --- Calendar (readonly) ---
-    "calendar.calendars.list": (
-        "calendar.readonly",
-        "_action_calendar_calendars_list",
-        "List the user's calendars (primary, shared, subscribed). Params: (none)",
-    ),
-    "calendar.events.list": (
-        "calendar.readonly",
-        "_action_calendar_events_list",
-        "List or search calendar events. Params: calendarId (str, default 'primary'), q (str), timeMin (ISO 8601, defaults to now), timeMax (ISO 8601), maxResults (int, default 20)",
-    ),
-    "calendar.events.get": (
-        "calendar.readonly",
-        "_action_calendar_events_get",
-        "Get full details of a calendar event. Params: eventId (str, required), calendarId (str, default 'primary')",
-    ),
-    "calendar.freebusy.query": (
-        "calendar.readonly",
-        "_action_calendar_freebusy_query",
-        "Check free/busy status for a time range. Params: timeMin (ISO 8601, required), timeMax (ISO 8601, required), calendarIds (list or comma-separated str, default ['primary'])",
-    ),
-    # --- Sheets (readonly) ---
-    "sheets.spreadsheets.get": (
-        "spreadsheets.readonly",
-        "_action_sheets_spreadsheets_get",
-        "Get spreadsheet metadata: sheet names, row/column counts, named ranges. Params: spreadsheetId (str, required)",
-    ),
-    "sheets.values.get": (
-        "spreadsheets.readonly",
-        "_action_sheets_values_get",
-        "Read a cell range as rows of values. Params: spreadsheetId (str, required), range (str, required, e.g. 'Sheet1!A1:D20')",
-    ),
-    "sheets.values.batchGet": (
-        "spreadsheets.readonly",
-        "_action_sheets_values_batch_get",
-        "Read multiple cell ranges in one call. Params: spreadsheetId (str, required), ranges (list of str, required, e.g. ['Sheet1!A1:B5', 'Sheet2!C1:C100'])",
-    ),
-    # Future actions go here.  Each entry automatically appears in the
-    # gws_action docstring and is gated by its required capability.
-}
+ACTIONS: dict = {}  # populated by @action decorators below
+
+
+def action(name: str, *, cap: str):
+    """Register a handler function as a named GWS action."""
+    def decorator(fn):
+        ACTIONS[name] = (cap, fn, fn.__doc__ or "")
+        return fn
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -248,24 +178,24 @@ def _strip_tool_routes(app):
 # ---------------------------------------------------------------------------
 
 
+def _app_state_dict(app, suffix: str) -> dict:
+    """Lazy-init a named dict on app.state.  Lost on restart — by design."""
+    key = f"__{TOOL_ID}_{suffix}__"
+    d = getattr(app.state, key, None)
+    if d is None:
+        d = {}
+        setattr(app.state, key, d)
+    return d
+
+
 def _token_cache(app) -> dict:
-    """Per-chat token cache.  Lost on restart — by design."""
-    key = f"__{TOOL_ID}_tokens__"
-    c = getattr(app.state, key, None)
-    if c is None:
-        c = {}
-        setattr(app.state, key, c)
-    return c
+    """Per-chat token cache."""
+    return _app_state_dict(app, "tokens")
 
 
 def _pending_states(app) -> dict:
-    """OAuth state -> {user_id, chat_id, requested_caps} for in-flight flows."""
-    key = f"__{TOOL_ID}_pending__"
-    s = getattr(app.state, key, None)
-    if s is None:
-        s = {}
-        setattr(app.state, key, s)
-    return s
+    """OAuth state -> {user_id, chat_id} for in-flight flows."""
+    return _app_state_dict(app, "pending")
 
 
 def _get_chat_token(app, user_id: str, chat_id: str) -> Optional[dict]:
@@ -445,12 +375,20 @@ def _require(params: dict, *names: str) -> str | None:
     return None
 
 
-async def _gws_get(url: str, token: str, app, user_id, chat_id,
-                   params: dict = None) -> tuple[dict | None, str | None]:
-    """GET a Google API URL. Returns (json, None) or (None, error_string)."""
+async def _gws_request(
+    method: str, url: str, token: str, app, user_id, chat_id,
+    params=None, body=None, raw=False,
+) -> tuple[dict | str | None, str | None]:
+    """
+    Make an authenticated Google API request.
+    Returns (json_or_text, None) on success, or (None, error_string) on failure.
+    Set raw=True to return response text instead of parsed JSON.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
     async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params=params,
-                                headers={"Authorization": f"Bearer {token}"})
+        resp = await client.request(method, url, params=params, json=body, headers=headers)
     if resp.status_code == 401:
         _clear_chat_token(app, user_id, chat_id)
         return None, "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
@@ -458,38 +396,7 @@ async def _gws_get(url: str, token: str, app, user_id, chat_id,
         return None, "NOT_FOUND: The requested resource was not found."
     if resp.status_code != 200:
         return None, f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-    return resp.json(), None
-
-
-async def _gws_post(url: str, token: str, app, user_id, chat_id,
-                    body: dict = None) -> tuple[dict | None, str | None]:
-    """POST to a Google API URL. Returns (json, None) or (None, error_string)."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json=body,
-                                 headers={"Authorization": f"Bearer {token}",
-                                          "Content-Type": "application/json"})
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return None, "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code == 404:
-        return None, "NOT_FOUND: The requested resource was not found."
-    if resp.status_code != 200:
-        return None, f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-    return resp.json(), None
-
-
-async def _gws_get_raw(url: str, token: str, app, user_id, chat_id,
-                       params: dict = None) -> tuple[str | None, int, str | None]:
-    """GET returning raw text (for file content). Returns (text, status, error)."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params=params,
-                                headers={"Authorization": f"Bearer {token}"})
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return None, 401, "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code != 200:
-        return None, resp.status_code, f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-    return resp.text, 200, None
+    return (resp.text if raw else resp.json()), None
 
 
 # ---------------------------------------------------------------------------
@@ -497,16 +404,17 @@ async def _gws_get_raw(url: str, token: str, app, user_id, chat_id,
 # ---------------------------------------------------------------------------
 
 
+@action("drive.files.search", cap="drive.readonly")
 async def _action_drive_search(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Search Drive for files matching a text query."""
+    """Search Drive files. Params: query (str, required)"""
     err = _require(params, "query")
     if err:
         return err
 
     query = params["query"]
     safe_q = query.replace("\\", "\\\\").replace("'", "\\'")
-    data, err = await _gws_get(
-        "https://www.googleapis.com/drive/v3/files",
+    data, err = await _gws_request(
+        "GET", "https://www.googleapis.com/drive/v3/files",
         token, app, user_id, chat_id, params={
             "q": f"fullText contains '{safe_q}' and trashed=false",
             "pageSize": 10,
@@ -530,15 +438,16 @@ async def _action_drive_search(token: str, params: dict, app, user_id, chat_id) 
     return f"RESULTS: {len(files)} file(s):\n" + "\n".join(fmt(f) for f in files)
 
 
+@action("drive.files.get", cap="drive.readonly")
 async def _action_drive_read(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read a Drive file by ID."""
+    """Read a Drive file (exports Docs as markdown, Sheets as CSV, Slides as text). Params: fileId (str, required)"""
     err = _require(params, "fileId")
     if err:
         return err
     file_id = params["fileId"]
 
-    meta, err = await _gws_get(
-        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+    meta, err = await _gws_request(
+        "GET", f"https://www.googleapis.com/drive/v3/files/{file_id}",
         token, app, user_id, chat_id, params={"fields": "id,name,mimeType,size"})
     if err:
         return err
@@ -553,13 +462,13 @@ async def _action_drive_read(token: str, params: dict, app, user_id, chat_id) ->
     }
 
     if mime in export_map:
-        text, _, err = await _gws_get_raw(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
-            token, app, user_id, chat_id, params={"mimeType": export_map[mime]})
+        text, err = await _gws_request(
+            "GET", f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
+            token, app, user_id, chat_id, params={"mimeType": export_map[mime]}, raw=True)
     elif mime.startswith("text/") or mime == "application/json":
-        text, _, err = await _gws_get_raw(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}",
-            token, app, user_id, chat_id, params={"alt": "media"})
+        text, err = await _gws_request(
+            "GET", f"https://www.googleapis.com/drive/v3/files/{file_id}",
+            token, app, user_id, chat_id, params={"alt": "media"}, raw=True)
     elif mime == "application/pdf":
         return (f"FILE_INFO: '{name}' is a PDF (no text extraction). "
                 f"Link: https://drive.google.com/file/d/{file_id}/view")
@@ -575,12 +484,13 @@ async def _action_drive_read(token: str, params: dict, app, user_id, chat_id) ->
     return f"FILE_CONTENT: name='{name}'{trunc}\n\n{content}"
 
 
+@action("drive.files.list", cap="drive.readonly")
 async def _action_drive_list(token: str, params: dict, app, user_id, chat_id) -> str:
-    """List files in a Drive folder."""
+    """List files in a Drive folder. Params: folderId (str, default 'root')"""
     folder_id = params.get("folderId", "root")
 
-    data, err = await _gws_get(
-        "https://www.googleapis.com/drive/v3/files",
+    data, err = await _gws_request(
+        "GET", "https://www.googleapis.com/drive/v3/files",
         token, app, user_id, chat_id, params={
             "q": f"'{folder_id}' in parents and trashed=false",
             "pageSize": 50,
@@ -699,8 +609,9 @@ def _format_message_full(msg: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+@action("gmail.messages.search", cap="gmail.readonly")
 async def _action_gmail_messages_search(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Search Gmail messages using Gmail search syntax."""
+    """Search Gmail messages (uses Gmail search syntax: from:, subject:, after:, etc.). Params: query (str), maxResults (int, default 10)"""
     query = params.get("query", "")
     max_results = min(int(params.get("maxResults", 10)), 20)
 
@@ -708,8 +619,8 @@ async def _action_gmail_messages_search(token: str, params: dict, app, user_id, 
     if query:
         api_params["q"] = query
 
-    data, err = await _gws_get(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+    data, err = await _gws_request(
+        "GET", "https://gmail.googleapis.com/gmail/v1/users/me/messages",
         token, app, user_id, chat_id, params=api_params)
     if err:
         return err
@@ -721,8 +632,8 @@ async def _action_gmail_messages_search(token: str, params: dict, app, user_id, 
     # Fetch metadata for each message sequentially
     results = []
     for stub in message_stubs:
-        msg, err = await _gws_get(
-            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{stub['id']}",
+        msg, err = await _gws_request(
+            "GET", f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{stub['id']}",
             token, app, user_id, chat_id,
             params={"format": "metadata",
                     "metadataHeaders": ["From", "Subject", "Date"]})
@@ -733,14 +644,15 @@ async def _action_gmail_messages_search(token: str, params: dict, app, user_id, 
     return f"RESULTS: {len(results)} message(s):\n" + "\n".join(results)
 
 
+@action("gmail.messages.get", cap="gmail.readonly")
 async def _action_gmail_messages_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read a single Gmail message by ID."""
+    """Read a single Gmail message with decoded body. Params: messageId (str, required)"""
     err = _require(params, "messageId")
     if err:
         return err
 
-    data, err = await _gws_get(
-        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{params['messageId']}",
+    data, err = await _gws_request(
+        "GET", f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{params['messageId']}",
         token, app, user_id, chat_id, params={"format": "full"})
     if err:
         return err
@@ -748,8 +660,9 @@ async def _action_gmail_messages_get(token: str, params: dict, app, user_id, cha
     return "MESSAGE:\n" + _format_message_full(data)
 
 
+@action("gmail.threads.list", cap="gmail.readonly")
 async def _action_gmail_threads_list(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Search Gmail threads."""
+    """Search Gmail threads. Params: query (str), maxResults (int, default 10)"""
     query = params.get("query", "")
     max_results = min(int(params.get("maxResults", 10)), 20)
 
@@ -757,8 +670,8 @@ async def _action_gmail_threads_list(token: str, params: dict, app, user_id, cha
     if query:
         api_params["q"] = query
 
-    data, err = await _gws_get(
-        "https://gmail.googleapis.com/gmail/v1/users/me/threads",
+    data, err = await _gws_request(
+        "GET", "https://gmail.googleapis.com/gmail/v1/users/me/threads",
         token, app, user_id, chat_id, params=api_params)
     if err:
         return err
@@ -775,14 +688,15 @@ async def _action_gmail_threads_list(token: str, params: dict, app, user_id, cha
     return f"RESULTS: {len(threads)} thread(s):\n" + "\n".join(lines)
 
 
+@action("gmail.threads.get", cap="gmail.readonly")
 async def _action_gmail_threads_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read all messages in a Gmail thread."""
+    """Read all messages in a Gmail thread. Params: threadId (str, required)"""
     err = _require(params, "threadId")
     if err:
         return err
 
-    data, err = await _gws_get(
-        f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{params['threadId']}",
+    data, err = await _gws_request(
+        "GET", f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{params['threadId']}",
         token, app, user_id, chat_id, params={"format": "full"})
     if err:
         return err
@@ -877,10 +791,11 @@ def _format_event_full(event: dict) -> str:
     return "\n".join(lines)
 
 
+@action("calendar.calendars.list", cap="calendar.readonly")
 async def _action_calendar_calendars_list(token: str, params: dict, app, user_id, chat_id) -> str:
-    """List the user's calendars."""
-    data, err = await _gws_get(
-        "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+    """List the user's calendars (primary, shared, subscribed). Params: (none)"""
+    data, err = await _gws_request(
+        "GET", "https://www.googleapis.com/calendar/v3/users/me/calendarList",
         token, app, user_id, chat_id, params={"maxResults": 100})
     if err:
         return err
@@ -898,8 +813,9 @@ async def _action_calendar_calendars_list(token: str, params: dict, app, user_id
     return f"CALENDARS: {len(calendars)} calendar(s):\n" + "\n".join(lines)
 
 
+@action("calendar.events.list", cap="calendar.readonly")
 async def _action_calendar_events_list(token: str, params: dict, app, user_id, chat_id) -> str:
-    """List or search calendar events."""
+    """List or search calendar events. Params: calendarId (str, default 'primary'), q (str), timeMin (ISO 8601, defaults to now), timeMax (ISO 8601), maxResults (int, default 20)"""
     calendar_id = params.get("calendarId", "primary")
     query = params.get("q", "")
     time_min = params.get("timeMin", "")
@@ -924,8 +840,8 @@ async def _action_calendar_events_list(token: str, params: dict, app, user_id, c
     if time_max:
         api_params["timeMax"] = time_max
 
-    data, err = await _gws_get(
-        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+    data, err = await _gws_request(
+        "GET", f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
         token, app, user_id, chat_id, params=api_params)
     if err:
         return err
@@ -938,15 +854,16 @@ async def _action_calendar_events_list(token: str, params: dict, app, user_id, c
     return f"EVENTS: {len(events)} event(s):\n" + "\n".join(lines)
 
 
+@action("calendar.events.get", cap="calendar.readonly")
 async def _action_calendar_events_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Get full details of a single calendar event."""
+    """Get full details of a calendar event. Params: eventId (str, required), calendarId (str, default 'primary')"""
     err = _require(params, "eventId")
     if err:
         return err
     calendar_id = params.get("calendarId", "primary")
 
-    data, err = await _gws_get(
-        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{params['eventId']}",
+    data, err = await _gws_request(
+        "GET", f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{params['eventId']}",
         token, app, user_id, chat_id)
     if err:
         return err
@@ -954,8 +871,9 @@ async def _action_calendar_events_get(token: str, params: dict, app, user_id, ch
     return "EVENT:\n" + _format_event_full(data)
 
 
+@action("calendar.freebusy.query", cap="calendar.readonly")
 async def _action_calendar_freebusy_query(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Check free/busy status across calendars for a time range."""
+    """Check free/busy status for a time range. Params: timeMin (ISO 8601, required), timeMax (ISO 8601, required), calendarIds (list or comma-separated str, default ['primary'])"""
     time_min = params.get("timeMin", "")
     time_max = params.get("timeMax", "")
     if not time_min or not time_max:
@@ -966,8 +884,8 @@ async def _action_calendar_freebusy_query(token: str, params: dict, app, user_id
     if isinstance(calendar_ids, str):
         calendar_ids = [c.strip() for c in calendar_ids.split(",")]
 
-    data, err = await _gws_post(
-        "https://www.googleapis.com/calendar/v3/freeBusy",
+    data, err = await _gws_request(
+        "POST", "https://www.googleapis.com/calendar/v3/freeBusy",
         token, app, user_id, chat_id,
         body={
             "timeMin": time_min,
@@ -1002,15 +920,16 @@ async def _action_calendar_freebusy_query(token: str, params: dict, app, user_id
 SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
 
 
+@action("sheets.spreadsheets.get", cap="spreadsheets.readonly")
 async def _action_sheets_spreadsheets_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Get spreadsheet metadata: sheet names, dimensions, named ranges."""
+    """Get spreadsheet metadata: sheet names, row/column counts, named ranges. Params: spreadsheetId (str, required)"""
     err = _require(params, "spreadsheetId")
     if err:
         return err
     spreadsheet_id = params["spreadsheetId"]
 
-    data, err = await _gws_get(
-        f"{SHEETS_API}/{spreadsheet_id}",
+    data, err = await _gws_request(
+        "GET", f"{SHEETS_API}/{spreadsheet_id}",
         token, app, user_id, chat_id,
         params={"fields": "spreadsheetId,properties.title,sheets.properties,namedRanges"})
     if err:
@@ -1082,16 +1001,17 @@ def _format_values_grid(values: list, range_label: str = "") -> str:
     return "\n".join(lines)
 
 
+@action("sheets.values.get", cap="spreadsheets.readonly")
 async def _action_sheets_values_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read a cell range from a spreadsheet."""
+    """Read a cell range as rows of values. Params: spreadsheetId (str, required), range (str, required, e.g. 'Sheet1!A1:D20')"""
     err = _require(params, "spreadsheetId", "range")
     if err:
         return err
     spreadsheet_id = params["spreadsheetId"]
     range_ = params["range"]
 
-    data, err = await _gws_get(
-        f"{SHEETS_API}/{spreadsheet_id}/values/{range_}",
+    data, err = await _gws_request(
+        "GET", f"{SHEETS_API}/{spreadsheet_id}/values/{range_}",
         token, app, user_id, chat_id,
         params={"valueRenderOption": "FORMATTED_VALUE"})
     if err:
@@ -1102,8 +1022,9 @@ async def _action_sheets_values_get(token: str, params: dict, app, user_id, chat
     return _format_values_grid(values, actual_range)
 
 
+@action("sheets.values.batchGet", cap="spreadsheets.readonly")
 async def _action_sheets_values_batch_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read multiple cell ranges from a spreadsheet in one call."""
+    """Read multiple cell ranges in one call. Params: spreadsheetId (str, required), ranges (list of str, required, e.g. ['Sheet1!A1:B5', 'Sheet2!C1:C100'])"""
     err = _require(params, "spreadsheetId", "ranges")
     if err:
         return err
@@ -1117,8 +1038,8 @@ async def _action_sheets_values_batch_get(token: str, params: dict, app, user_id
     for r in ranges:
         param_tuples.append(("ranges", r))
 
-    data, err = await _gws_get(
-        f"{SHEETS_API}/{spreadsheet_id}/values:batchGet",
+    data, err = await _gws_request(
+        "GET", f"{SHEETS_API}/{spreadsheet_id}/values:batchGet",
         token, app, user_id, chat_id, params=param_tuples)
     if err:
         return err
@@ -1135,24 +1056,6 @@ async def _action_sheets_values_batch_get(token: str, params: dict, app, user_id
 
     return "\n\n".join(parts)
 
-
-# Handler lookup (module-level functions by name)
-_ACTION_HANDLERS = {
-    "_action_drive_search": _action_drive_search,
-    "_action_drive_read": _action_drive_read,
-    "_action_drive_list": _action_drive_list,
-    "_action_gmail_messages_search": _action_gmail_messages_search,
-    "_action_gmail_messages_get": _action_gmail_messages_get,
-    "_action_gmail_threads_list": _action_gmail_threads_list,
-    "_action_gmail_threads_get": _action_gmail_threads_get,
-    "_action_calendar_calendars_list": _action_calendar_calendars_list,
-    "_action_calendar_events_list": _action_calendar_events_list,
-    "_action_calendar_events_get": _action_calendar_events_get,
-    "_action_calendar_freebusy_query": _action_calendar_freebusy_query,
-    "_action_sheets_spreadsheets_get": _action_sheets_spreadsheets_get,
-    "_action_sheets_values_get": _action_sheets_values_get,
-    "_action_sheets_values_batch_get": _action_sheets_values_batch_get,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -1332,7 +1235,7 @@ class Tools:
             available = ", ".join(sorted(ACTIONS.keys()))
             return f"ERROR: Unknown action '{action}'. Available actions: {available}"
 
-        required_cap, handler_name, action_desc = action_entry
+        required_cap, handler, action_desc = action_entry
         admin_caps = _parse_caps(self.valves.enabled_capabilities)
 
         # Gate 1: admin capability ceiling
@@ -1370,10 +1273,6 @@ class Tools:
             return f"ERROR: Invalid JSON in params: {e}"
 
         # Dispatch to handler
-        handler = _ACTION_HANDLERS.get(handler_name)
-        if not handler:
-            return f"ERROR: Handler '{handler_name}' not found (internal error)."
-
         try:
             return await handler(token, parsed_params, app, user_id, __chat_id__)
         except Exception as e:
