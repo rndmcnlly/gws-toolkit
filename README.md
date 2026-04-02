@@ -5,7 +5,7 @@ Open WebUI tool that gives users fine-grained, per-chat access to Google Workspa
 ## What it does
 
 - **`gws_authorize`** — request authorization for specific capabilities in the current chat, or call with no arguments to inspect what's granted and what's available
-- **`gws_action`** — execute Google Workspace actions (e.g. `drive.files.search`, `drive.files.get`, `drive.files.list`), gated by both admin-enabled capabilities and per-chat user authorization
+- **`gws_action`** — execute Google Workspace actions across Drive, Gmail, and Calendar, gated by both admin-enabled capabilities and per-chat user authorization
 
 Admin valves set a capability ceiling. Users can only authorize up to the admin-allowed maximum, and must re-consent in each new chat.
 
@@ -61,7 +61,23 @@ Capability names mirror Google's OAuth scope suffixes. Admins and users see the 
 | `presentations.readonly` | `presentations.readonly` | Read Slides content |
 | `presentations` | `presentations` | Read and write Slides |
 
-Currently only Drive actions are implemented. The capability registry is forward-declared for future services.
+Drive, Gmail, and Calendar actions are implemented. The capability registry is forward-declared for additional services.
+
+## Actions
+
+| Action | Capability | Description |
+|---|---|---|
+| `drive.files.search` | `drive.readonly` | Full-text search across Drive |
+| `drive.files.get` | `drive.readonly` | Read a file (exports Docs as markdown, Sheets as CSV, Slides as text) |
+| `drive.files.list` | `drive.readonly` | List folder contents |
+| `gmail.messages.search` | `gmail.readonly` | Search messages using Gmail search syntax |
+| `gmail.messages.get` | `gmail.readonly` | Read a message (decodes MIME body to text) |
+| `gmail.threads.list` | `gmail.readonly` | Search threads |
+| `gmail.threads.get` | `gmail.readonly` | Read all messages in a thread |
+| `calendar.calendars.list` | `calendar.readonly` | List available calendars |
+| `calendar.events.list` | `calendar.readonly` | List/search events (defaults to upcoming) |
+| `calendar.events.get` | `calendar.readonly` | Full event details |
+| `calendar.freebusy.query` | `calendar.readonly` | Check free/busy status for a time range |
 
 ## Admin setup
 
@@ -81,7 +97,13 @@ Set the consent screen to **Internal** if all users are on your Google Workspace
 
 ### 3. Enable the relevant APIs
 
-Ensure the **Google Drive API** (and any other APIs matching your enabled capabilities) is enabled in the same GCP project.
+Enable the Google APIs matching your enabled capabilities in the same GCP project:
+
+- **Google Drive API** for `drive.readonly` / `drive`
+- **Gmail API** for `gmail.readonly` / `gmail.send`
+- **Google Calendar API** for `calendar.readonly` / `calendar.events`
+
+APIs that aren't enabled will return a 403 with a direct link to the GCP console to enable them.
 
 ### 4. Install the tool
 
@@ -116,7 +138,7 @@ Power users can add a system prompt instruction to call `gws_authorize` up front
 
 ## Limitations
 
-- **Drive actions only (for now).** Gmail, Calendar, Sheets, etc. are declared in the capability registry but have no action handlers yet. Adding them is additive — new entries in `ACTIONS` and new handler functions.
+- **Readonly only (for now).** Drive, Gmail, and Calendar all have readonly action handlers. Write capabilities (sending email, creating events, editing files) are declared in the capability registry but have no action handlers yet. Adding them is additive — new entries in `ACTIONS` and new handler functions.
 - **~1 hour token lifetime.** Access tokens from `access_type=online` expire in about an hour. For long chats, the LLM will see `AUTH_EXPIRED` and re-trigger authorization. This is consistent with the per-chat consent model.
 - **Orphaned routes on tool deletion.** OWUI has no `on_delete` hook, so the callback route persists until server restart.
 - **Single-page export for Sheets.** `drive.files.get` exports the first sheet as CSV via Drive export. Full multi-sheet access requires the Sheets API (future `spreadsheets.*` actions).

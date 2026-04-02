@@ -4,14 +4,17 @@ author: Adam Smith
 author_url: https://adamsmith.as
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available.
 required_open_webui_version: 0.4.0
-version: 0.4.0
+version: 0.5.0
 licence: MIT
 requirements: httpx
 """
 
+import base64
 import hashlib
+import html as html_mod
 import httpx
 import json
+import re
 import secrets
 import time
 import urllib.parse
@@ -23,7 +26,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.4.0"
+TOOL_VERSION = "0.5.0"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -140,6 +143,48 @@ ACTIONS = {
         "drive.readonly",
         "_action_drive_list",
         "List files in a Drive folder",
+    ),
+    # --- Gmail (readonly) ---
+    "gmail.messages.search": (
+        "gmail.readonly",
+        "_action_gmail_messages_search",
+        "Search Gmail messages (uses Gmail search syntax: from:, subject:, after:, etc.)",
+    ),
+    "gmail.messages.get": (
+        "gmail.readonly",
+        "_action_gmail_messages_get",
+        "Read a single Gmail message by ID (decodes body to text)",
+    ),
+    "gmail.threads.list": (
+        "gmail.readonly",
+        "_action_gmail_threads_list",
+        "Search Gmail threads (returns thread snippets)",
+    ),
+    "gmail.threads.get": (
+        "gmail.readonly",
+        "_action_gmail_threads_get",
+        "Read all messages in a Gmail thread",
+    ),
+    # --- Calendar (readonly) ---
+    "calendar.calendars.list": (
+        "calendar.readonly",
+        "_action_calendar_calendars_list",
+        "List the user's calendars (primary, shared, subscribed)",
+    ),
+    "calendar.events.list": (
+        "calendar.readonly",
+        "_action_calendar_events_list",
+        "List or search calendar events (supports time range and text query)",
+    ),
+    "calendar.events.get": (
+        "calendar.readonly",
+        "_action_calendar_events_get",
+        "Get full details of a single calendar event",
+    ),
+    "calendar.freebusy.query": (
+        "calendar.readonly",
+        "_action_calendar_freebusy_query",
+        "Check free/busy status across calendars for a time range",
     ),
     # Future actions go here.  Each entry automatically appears in the
     # gws_action docstring and is gated by its required capability.
@@ -501,11 +546,470 @@ async def _action_drive_list(token: str, params: dict, app, user_id, chat_id) ->
     return f"LISTING: {len(files)} item(s):\n" + "\n".join(fmt(f) for f in files)
 
 
+# ---------------------------------------------------------------------------
+# Gmail helpers
+# ---------------------------------------------------------------------------
+
+
+def _decode_mime_body(payload: dict) -> str:
+    """Extract readable text from a Gmail message payload (recursive MIME walk)."""
+    # Direct body on this part
+    body_data = payload.get("body", {}).get("data", "")
+    mime_type = payload.get("mimeType", "")
+
+    # Leaf node with data
+    if body_data and not payload.get("parts"):
+        decoded = base64.urlsafe_b64decode(body_data).decode("utf-8", errors="replace")
+        if mime_type == "text/plain":
+            return decoded
+        if mime_type == "text/html":
+            # Strip HTML tags to get readable text
+            text = re.sub(r"<style[^>]*>.*?</style>", "", decoded, flags=re.DOTALL)
+            text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = html_mod.unescape(text)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text
+        return decoded
+
+    # Multipart — recurse, preferring text/plain
+    parts = payload.get("parts", [])
+    plain_parts = []
+    html_parts = []
+    other_parts = []
+    for part in parts:
+        mt = part.get("mimeType", "")
+        if mt == "text/plain" or mt.startswith("multipart/"):
+            plain_parts.append(part)
+        elif mt == "text/html":
+            html_parts.append(part)
+        else:
+            other_parts.append(part)
+
+    # Try plain first, then html, then anything
+    for group in [plain_parts, html_parts, other_parts]:
+        for part in group:
+            result = _decode_mime_body(part)
+            if result.strip():
+                return result
+
+    return "(no readable body)"
+
+
+def _extract_header(headers: list, name: str) -> str:
+    """Extract a header value by name from a Gmail headers list."""
+    for h in headers:
+        if h.get("name", "").lower() == name.lower():
+            return h.get("value", "")
+    return ""
+
+
+def _format_message_summary(msg: dict) -> str:
+    """Format a Gmail message into a one-line summary."""
+    headers = msg.get("payload", {}).get("headers", [])
+    from_ = _extract_header(headers, "From")
+    subject = _extract_header(headers, "Subject")
+    date = _extract_header(headers, "Date")
+    snippet = msg.get("snippet", "")
+    msg_id = msg.get("id", "")
+    return (f"- from={from_} | subject={subject} | date={date} "
+            f"| id={msg_id}\n  {snippet}")
+
+
+def _format_message_full(msg: dict) -> str:
+    """Format a Gmail message with headers and decoded body."""
+    headers = msg.get("payload", {}).get("headers", [])
+    from_ = _extract_header(headers, "From")
+    to = _extract_header(headers, "To")
+    subject = _extract_header(headers, "Subject")
+    date = _extract_header(headers, "Date")
+    cc = _extract_header(headers, "Cc")
+
+    body = _decode_mime_body(msg.get("payload", {}))
+    if len(body) > 8192:
+        body = body[:8192] + "\n\n(TRUNCATED)"
+
+    header_block = f"From: {from_}\nTo: {to}\nDate: {date}\nSubject: {subject}"
+    if cc:
+        header_block += f"\nCc: {cc}"
+
+    return f"{header_block}\n\n{body}"
+
+
+# ---------------------------------------------------------------------------
+# Gmail action handlers
+# ---------------------------------------------------------------------------
+
+
+async def _action_gmail_messages_search(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Search Gmail messages using Gmail search syntax."""
+    query = params.get("query", "")
+    max_results = min(int(params.get("max_results", 10)), 20)
+
+    api_params = {"userId": "me", "maxResults": max_results}
+    if query:
+        api_params["q"] = query
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            params=api_params,
+            headers={"Authorization": f"Bearer {token}"})
+
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code != 200:
+        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+
+    message_stubs = resp.json().get("messages", [])
+    if not message_stubs:
+        return f"NO_RESULTS: No messages matching '{query}'."
+
+    # Fetch metadata for each message (batched sequentially — Gmail has no
+    # batch endpoint in the REST API without multipart, keep it simple)
+    results = []
+    async with httpx.AsyncClient() as client:
+        for stub in message_stubs:
+            msg_resp = await client.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{stub['id']}",
+                params={"format": "metadata",
+                        "metadataHeaders": ["From", "Subject", "Date"]},
+                headers={"Authorization": f"Bearer {token}"})
+            if msg_resp.status_code == 200:
+                msg = msg_resp.json()
+                msg["snippet"] = msg.get("snippet", "")
+                results.append(_format_message_summary(msg))
+
+    return f"RESULTS: {len(results)} message(s):\n" + "\n".join(results)
+
+
+async def _action_gmail_messages_get(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Read a single Gmail message by ID."""
+    message_id = params.get("message_id", "")
+    if not message_id:
+        return "ERROR: 'message_id' parameter is required."
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+            params={"format": "full"},
+            headers={"Authorization": f"Bearer {token}"})
+
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code == 404:
+        return f"NOT_FOUND: Message '{message_id}' not found."
+    if resp.status_code != 200:
+        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+
+    return "MESSAGE:\n" + _format_message_full(resp.json())
+
+
+async def _action_gmail_threads_list(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Search Gmail threads."""
+    query = params.get("query", "")
+    max_results = min(int(params.get("max_results", 10)), 20)
+
+    api_params = {"userId": "me", "maxResults": max_results}
+    if query:
+        api_params["q"] = query
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/threads",
+            params=api_params,
+            headers={"Authorization": f"Bearer {token}"})
+
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code != 200:
+        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+
+    threads = resp.json().get("threads", [])
+    if not threads:
+        return f"NO_RESULTS: No threads matching '{query}'."
+
+    lines = []
+    for t in threads:
+        snippet = t.get("snippet", "")
+        lines.append(f"- id={t['id']} | {snippet[:120]}")
+
+    return f"RESULTS: {len(threads)} thread(s):\n" + "\n".join(lines)
+
+
+async def _action_gmail_threads_get(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Read all messages in a Gmail thread."""
+    thread_id = params.get("thread_id", "")
+    if not thread_id:
+        return "ERROR: 'thread_id' parameter is required."
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}",
+            params={"format": "full"},
+            headers={"Authorization": f"Bearer {token}"})
+
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code == 404:
+        return f"NOT_FOUND: Thread '{thread_id}' not found."
+    if resp.status_code != 200:
+        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+
+    messages = resp.json().get("messages", [])
+    if not messages:
+        return "EMPTY: Thread contains no messages."
+
+    parts = [f"THREAD: {len(messages)} message(s)\n"]
+    for i, msg in enumerate(messages, 1):
+        parts.append(f"--- Message {i}/{len(messages)} ---")
+        parts.append(_format_message_full(msg))
+
+    result = "\n\n".join(parts)
+    if len(result) > 32768:
+        result = result[:32768] + "\n\n(TRUNCATED)"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Calendar action handlers
+# ---------------------------------------------------------------------------
+
+
+def _format_event_summary(event: dict) -> str:
+    """Format a calendar event into a summary line."""
+    summary = event.get("summary", "(no title)")
+    start = event.get("start", {})
+    start_str = start.get("dateTime", start.get("date", "?"))
+    end = event.get("end", {})
+    end_str = end.get("dateTime", end.get("date", ""))
+    location = event.get("location", "")
+    event_id = event.get("id", "")
+
+    line = f"- {summary} | start={start_str}"
+    if end_str:
+        line += f" | end={end_str}"
+    if location:
+        line += f" | location={location}"
+    line += f" | id={event_id}"
+    return line
+
+
+def _format_event_full(event: dict) -> str:
+    """Format a calendar event with full details."""
+    summary = event.get("summary", "(no title)")
+    start = event.get("start", {})
+    start_str = start.get("dateTime", start.get("date", "?"))
+    end = event.get("end", {})
+    end_str = end.get("dateTime", end.get("date", ""))
+    location = event.get("location", "")
+    description = event.get("description", "")
+    status = event.get("status", "")
+    organizer = event.get("organizer", {}).get("email", "")
+    html_link = event.get("htmlLink", "")
+    hangout = event.get("hangoutLink", "")
+    conference = ""
+    for entry_point in event.get("conferenceData", {}).get("entryPoints", []):
+        if entry_point.get("entryPointType") == "video":
+            conference = entry_point.get("uri", "")
+            break
+
+    attendees = event.get("attendees", [])
+    attendee_strs = []
+    for a in attendees[:20]:
+        name = a.get("displayName", a.get("email", "?"))
+        resp_status = a.get("responseStatus", "")
+        attendee_strs.append(f"  {name} ({resp_status})")
+
+    lines = [f"Event: {summary}"]
+    lines.append(f"When: {start_str} to {end_str}")
+    if location:
+        lines.append(f"Location: {location}")
+    if organizer:
+        lines.append(f"Organizer: {organizer}")
+    if status:
+        lines.append(f"Status: {status}")
+    if conference:
+        lines.append(f"Video: {conference}")
+    elif hangout:
+        lines.append(f"Hangout: {hangout}")
+    if html_link:
+        lines.append(f"Link: {html_link}")
+    if attendee_strs:
+        lines.append(f"Attendees ({len(attendees)}):")
+        lines.extend(attendee_strs)
+    if description:
+        if len(description) > 2000:
+            description = description[:2000] + "... (truncated)"
+        lines.append(f"\nDescription:\n{description}")
+
+    return "\n".join(lines)
+
+
+async def _action_calendar_calendars_list(token: str, params: dict, app, user_id, chat_id) -> str:
+    """List the user's calendars."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+            params={"maxResults": 100},
+            headers={"Authorization": f"Bearer {token}"})
+
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code != 200:
+        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+
+    calendars = resp.json().get("items", [])
+    if not calendars:
+        return "EMPTY: No calendars found."
+
+    lines = []
+    for cal in calendars:
+        primary = " (PRIMARY)" if cal.get("primary") else ""
+        access = cal.get("accessRole", "")
+        lines.append(f"- {cal.get('summary', '?')}{primary} | access={access} | id={cal.get('id', '')}")
+
+    return f"CALENDARS: {len(calendars)} calendar(s):\n" + "\n".join(lines)
+
+
+async def _action_calendar_events_list(token: str, params: dict, app, user_id, chat_id) -> str:
+    """List or search calendar events."""
+    calendar_id = params.get("calendar_id", "primary")
+    query = params.get("query", "")
+    time_min = params.get("time_min", "")
+    time_max = params.get("time_max", "")
+    max_results = min(int(params.get("max_results", 20)), 50)
+
+    # Default time_min to now — without this, singleEvents=true expands
+    # recurring events from their origin (e.g. birthday events from birth
+    # year), flooding results with historical instances.
+    if not time_min:
+        time_min = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    api_params = {
+        "calendarId": calendar_id,
+        "maxResults": max_results,
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "timeMin": time_min,
+    }
+    if query:
+        api_params["q"] = query
+    if time_max:
+        api_params["timeMax"] = time_max
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+            params=api_params,
+            headers={"Authorization": f"Bearer {token}"})
+
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code != 200:
+        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+
+    events = resp.json().get("items", [])
+    if not events:
+        return "NO_RESULTS: No events found for the given criteria."
+
+    lines = [_format_event_summary(e) for e in events]
+    return f"EVENTS: {len(events)} event(s):\n" + "\n".join(lines)
+
+
+async def _action_calendar_events_get(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Get full details of a single calendar event."""
+    event_id = params.get("event_id", "")
+    if not event_id:
+        return "ERROR: 'event_id' parameter is required."
+    calendar_id = params.get("calendar_id", "primary")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+            headers={"Authorization": f"Bearer {token}"})
+
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code == 404:
+        return f"NOT_FOUND: Event '{event_id}' not found."
+    if resp.status_code != 200:
+        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+
+    return "EVENT:\n" + _format_event_full(resp.json())
+
+
+async def _action_calendar_freebusy_query(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Check free/busy status across calendars for a time range."""
+    time_min = params.get("time_min", "")
+    time_max = params.get("time_max", "")
+    if not time_min or not time_max:
+        return "ERROR: 'time_min' and 'time_max' parameters are required (ISO 8601, e.g. '2026-04-03T09:00:00-07:00')."
+
+    # Default to primary calendar if none specified
+    calendar_ids = params.get("calendar_ids", ["primary"])
+    if isinstance(calendar_ids, str):
+        calendar_ids = [c.strip() for c in calendar_ids.split(",")]
+
+    body = {
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "items": [{"id": cid} for cid in calendar_ids],
+    }
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://www.googleapis.com/calendar/v3/freeBusy",
+            json=body,
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"})
+
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code != 200:
+        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+
+    data = resp.json()
+    calendars = data.get("calendars", {})
+
+    lines = [f"FREE/BUSY: {time_min} to {time_max}\n"]
+    for cal_id, info in calendars.items():
+        errors = info.get("errors", [])
+        if errors:
+            lines.append(f"  {cal_id}: ERROR — {errors[0].get('reason', '?')}")
+            continue
+        busy = info.get("busy", [])
+        if not busy:
+            lines.append(f"  {cal_id}: FREE (no busy periods)")
+        else:
+            lines.append(f"  {cal_id}: {len(busy)} busy period(s):")
+            for period in busy:
+                lines.append(f"    {period.get('start', '?')} to {period.get('end', '?')}")
+
+    return "\n".join(lines)
+
+
 # Handler lookup (module-level functions by name)
 _ACTION_HANDLERS = {
     "_action_drive_search": _action_drive_search,
     "_action_drive_read": _action_drive_read,
     "_action_drive_list": _action_drive_list,
+    "_action_gmail_messages_search": _action_gmail_messages_search,
+    "_action_gmail_messages_get": _action_gmail_messages_get,
+    "_action_gmail_threads_list": _action_gmail_threads_list,
+    "_action_gmail_threads_get": _action_gmail_threads_get,
+    "_action_calendar_calendars_list": _action_calendar_calendars_list,
+    "_action_calendar_events_list": _action_calendar_events_list,
+    "_action_calendar_events_get": _action_calendar_events_get,
+    "_action_calendar_freebusy_query": _action_calendar_freebusy_query,
 }
 
 
