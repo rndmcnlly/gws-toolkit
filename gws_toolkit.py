@@ -11,6 +11,7 @@ requirements: httpx
 
 import hashlib
 import httpx
+import json
 import secrets
 import time
 import urllib.parse
@@ -270,7 +271,6 @@ def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
 
         user_id = flow["user_id"]
         chat_id = flow["chat_id"]
-        requested_caps = flow["requested_caps"]
 
         async with httpx.AsyncClient() as client:
             resp = await client.post(GOOGLE_TOKEN_URL, data={
@@ -347,7 +347,6 @@ def _build_auth_url(
     _pending_states(app)[state] = {
         "user_id": user_id,
         "chat_id": chat_id,
-        "requested_caps": requested_caps,
     }
 
     # Check if user already has some scopes in this chat — if so, use
@@ -444,7 +443,7 @@ async def _action_drive_read(token: str, params: dict, app, user_id, chat_id) ->
         }
 
         if mime in export_map:
-            export_mime, ext = export_map[mime]
+            export_mime = export_map[mime][0]
             resp = await client.get(
                 f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
                 params={"mimeType": export_mime}, headers=headers)
@@ -452,7 +451,6 @@ async def _action_drive_read(token: str, params: dict, app, user_id, chat_id) ->
             resp = await client.get(
                 f"https://www.googleapis.com/drive/v3/files/{file_id}",
                 params={"alt": "media"}, headers=headers)
-            ext = mime.split("/")[-1]
         elif mime == "application/pdf":
             return (f"FILE_INFO: '{name}' is a PDF (no text extraction). "
                     f"Link: https://drive.google.com/file/d/{file_id}/view")
@@ -569,7 +567,6 @@ class Tools:
 
     def __init__(self):
         self.valves = self.Valves()
-        self.citation = True
 
     # -------------------------------------------------------------------
     # Tool: gws_authorize
@@ -723,10 +720,9 @@ class Tools:
         token = entry["access_token"]
 
         # Parse params
-        import json as _json
         try:
-            parsed_params = _json.loads(params) if isinstance(params, str) else params
-        except _json.JSONDecodeError as e:
+            parsed_params = json.loads(params) if isinstance(params, str) else params
+        except json.JSONDecodeError as e:
             return f"ERROR: Invalid JSON in params: {e}"
 
         # Dispatch to handler

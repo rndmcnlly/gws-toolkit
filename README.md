@@ -1,36 +1,67 @@
 # Google Workspace Toolkit for Open WebUI
 
-Proof-of-concept Open WebUI tool that gives users read-only access to their Google Drive through native function calling. Each user authorizes with their own Google account via OAuth2 -- no service accounts, no shared credentials. User refresh tokens are stored in OWUI's database; admins with DB access can read them.
+Open WebUI tool that gives users fine-grained, per-chat access to Google Workspace APIs through native function calling. Each user authorizes with their own Google account via OAuth2 — no service accounts, no shared credentials. Tokens are ephemeral: every chat starts unauthorized, and access is scoped to exactly the capabilities needed.
 
 ## What it does
 
-- **`connect_google_workspace`** -- generates a per-user OAuth2 authorization link
-- **`search_drive`** -- full-text search across the user's Drive
-- **`read_drive_file`** -- reads Docs (as markdown), Sheets (as CSV), Slides (as text), and plain text files
-- **`list_drive_folder`** -- lists folder contents
-- **`disconnect_google_workspace`** -- revokes tokens and clears stored credentials
+- **`gws_authorize`** — request authorization for specific capabilities in the current chat, or call with no arguments to inspect what's granted and what's available
+- **`gws_action`** — execute Google Workspace actions (e.g. `drive.files.search`, `drive.files.get`, `drive.files.list`), gated by both admin-enabled capabilities and per-chat user authorization
 
-The tool self-registers an OAuth callback endpoint on the OWUI FastAPI app at runtime. Refresh tokens are persisted to OWUI's database per-user, so authorization survives server restarts. Access tokens are cached in-process for performance.
+Admin valves set a capability ceiling. Users can only authorize up to the admin-allowed maximum, and must re-consent in each new chat.
 
 ## Architecture
 
 ```
-User in chat ──► LLM calls tool method ──► Tool checks for stored token
-                                              │
-                              ┌────────────── has token? ──────────────┐
-                              │ no                                     │ yes
-                              ▼                                        ▼
-                   return auth URL to LLM              refresh if needed, call
-                   LLM presents link to user           Google Drive REST API
+User in chat ──► LLM calls gws_action ──► Dispatcher checks:
+                                            1. Is this action's capability admin-enabled?
+                                            2. Does this chat have a token with that capability?
+                              ┌──────────── both yes ────────────┐
+                              │                                   │
+                              │ no                                ▼
+                              ▼                          Call Google API,
+                   Return AUTH_REQUIRED                  return results
+                   LLM calls gws_authorize
                               │
                               ▼
-                   User clicks link ──► Google consent ──► callback endpoint
+                   Return consent URL to user
+                   User clicks ──► Google consent ──► callback endpoint
                               │
                               ▼
-                   Exchange code for tokens, persist refresh token to DB
+                   Exchange code for access token
+                   Store in per-chat in-memory cache
+                   User retries request
 ```
 
-The callback endpoint is injected into OWUI's FastAPI routing table before the SPA catch-all mount. See the [route registration pattern](https://gist.github.com/rndmcnlly/740a0238962de750c5fd14e606fe8c90) for details on why this is necessary.
+Key properties:
+- **Ephemeral tokens.** No database persistence, no refresh tokens. Tokens live in-process memory keyed by `(user_id, chat_id)` and are lost on server restart. This is by design.
+- **Per-chat authorization.** Each chat starts with no access. Users consent to exactly what's needed for that conversation.
+- **Incremental auth.** If a chat needs Drive first and Calendar later, the user consents to each separately. Google's `include_granted_scopes` merges them into one token.
+- **Admin capability ceiling.** The `enabled_capabilities` valve determines what's possible. Users can never exceed it.
+
+The callback endpoint is injected into OWUI's FastAPI routing table before the SPA catch-all mount. See the [route registration pattern](https://gist.github.com/rndmcnlly/740a0238962de750c5fd14e606fe8c90) for details.
+
+## Capabilities
+
+Capability names mirror Google's OAuth scope suffixes. Admins and users see the same names Google uses.
+
+| Capability | Google Scope | Description |
+|---|---|---|
+| `drive.readonly` | `drive.readonly` | Search, read, list Drive files |
+| `drive` | `drive` | Full Drive access |
+| `gmail.readonly` | `gmail.readonly` | Read Gmail messages |
+| `gmail.send` | `gmail.send` | Send email |
+| `calendar.readonly` | `calendar.readonly` | View calendar events |
+| `calendar.events` | `calendar.events` | View and edit events |
+| `spreadsheets.readonly` | `spreadsheets.readonly` | Read Sheets data |
+| `spreadsheets` | `spreadsheets` | Read and write Sheets |
+| `tasks.readonly` | `tasks.readonly` | View Google Tasks |
+| `tasks` | `tasks` | Manage Google Tasks |
+| `documents.readonly` | `documents.readonly` | Read Docs content |
+| `documents` | `documents` | Read and write Docs |
+| `presentations.readonly` | `presentations.readonly` | Read Slides content |
+| `presentations` | `presentations` | Read and write Slides |
+
+Currently only Drive actions are implemented. The capability registry is forward-declared for future services.
 
 ## Admin setup
 
@@ -48,11 +79,9 @@ https://<your-owui-host>/api/v1/x/gws_toolkit/oauth/callback
 
 Set the consent screen to **Internal** if all users are on your Google Workspace domain. Otherwise use **External** with test users.
 
-No sensitive or restricted scope verification is needed for `drive.readonly` on Internal apps.
+### 3. Enable the relevant APIs
 
-### 3. Enable the Drive API
-
-Ensure the **Google Drive API** is enabled in the same GCP project.
+Ensure the **Google Drive API** (and any other APIs matching your enabled capabilities) is enabled in the same GCP project.
 
 ### 4. Install the tool
 
@@ -65,8 +94,9 @@ Upload `gws_toolkit.py` as a new tool in Open WebUI (Workspace > Tools), or push
 | `google_client_id` | Your OAuth Web Application client ID |
 | `google_client_secret` | Your OAuth Web Application client secret |
 | `base_url` | Public URL of your OWUI instance (e.g. `https://chat.example.com`) |
+| `enabled_capabilities` | Comma-separated capability ceiling (e.g. `drive.readonly,calendar.readonly`) |
 
-The `base_url` must match what you configured as the redirect URI origin in step 1.
+The `base_url` must match the redirect URI origin configured in step 1.
 
 ### 6. Enable the tool on a model
 
@@ -75,23 +105,22 @@ In Workspace > Models, enable "Google Workspace" for any model that supports nat
 ## User experience
 
 1. User asks something that needs Drive access (e.g. "find my budget spreadsheet")
-2. LLM calls `search_drive`, tool returns `NOT_CONNECTED`
-3. LLM calls `connect_google_workspace`, tool returns an auth URL
+2. LLM calls `gws_action(action="drive.files.search", ...)`, gets `AUTH_REQUIRED`
+3. LLM calls `gws_authorize(capabilities="drive.readonly")`, gets a consent URL
 4. LLM presents the link, user clicks it, authorizes in a new tab
 5. Tab closes automatically, user retries their request
-6. Subsequent requests work without re-authorization
+6. Subsequent Drive requests in this chat work without re-authorization
+7. New chat → starts fresh, requires new consent
+
+Power users can add a system prompt instruction to call `gws_authorize` up front with their preferred capability set.
 
 ## Limitations
 
-- **Drive read-only.** This is a deliberate scope constraint for the PoC. Adding Gmail, Calendar, Sheets write, etc. is straightforward (more scopes + more tool methods).
-- **Tokens are in-process cached.** Access tokens live in `app.state` and are lost on OWUI restart. Refresh tokens persist in the DB, so users don't need to re-authorize -- but the first request after a restart incurs a token refresh round-trip.
-- **Orphaned routes on tool deletion.** OWUI has no `on_delete` hook, so the callback route persists in the routing table until the next server restart. Harmless but worth knowing.
-- **Single-page export for Sheets.** `read_drive_file` exports the first sheet as CSV. Multi-sheet spreadsheets need the Sheets API for full access.
+- **Drive actions only (for now).** Gmail, Calendar, Sheets, etc. are declared in the capability registry but have no action handlers yet. Adding them is additive — new entries in `ACTIONS` and new handler functions.
+- **~1 hour token lifetime.** Access tokens from `access_type=online` expire in about an hour. For long chats, the LLM will see `AUTH_EXPIRED` and re-trigger authorization. This is consistent with the per-chat consent model.
+- **Orphaned routes on tool deletion.** OWUI has no `on_delete` hook, so the callback route persists until server restart.
+- **Single-page export for Sheets.** `drive.files.get` exports the first sheet as CSV via Drive export. Full multi-sheet access requires the Sheets API (future `spreadsheets.*` actions).
 
 ## Files
 
-- `gws_toolkit.py` -- the tool (single file, deploy as-is)
-
-## See also
-
-- [Google Workspace CLI](https://github.com/googleworkspace/cli) -- the `gws` CLI that inspired this tool's API surface. Useful for local prototyping against the same Google APIs.
+- `gws_toolkit.py` — the tool (single file, deploy as-is)
