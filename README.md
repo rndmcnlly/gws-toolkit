@@ -61,7 +61,7 @@ Capability names mirror Google's OAuth scope suffixes. Admins and users see the 
 | `presentations.readonly` | `presentations.readonly` | Read Slides content |
 | `presentations` | `presentations` | Read and write Slides |
 
-Drive, Gmail, and Calendar actions are implemented. The capability registry is forward-declared for additional services.
+Drive, Gmail, Calendar, and Sheets actions are implemented. The capability registry is forward-declared for additional services.
 
 ## Actions
 
@@ -78,6 +78,9 @@ Drive, Gmail, and Calendar actions are implemented. The capability registry is f
 | `calendar.events.list` | `calendar.readonly` | List/search events (defaults to upcoming) |
 | `calendar.events.get` | `calendar.readonly` | Full event details |
 | `calendar.freebusy.query` | `calendar.readonly` | Check free/busy status for a time range |
+| `sheets.spreadsheets.get` | `spreadsheets.readonly` | Spreadsheet metadata: sheet names, dimensions, named ranges |
+| `sheets.values.get` | `spreadsheets.readonly` | Read a cell range (e.g. `Sheet1!A1:D20`) |
+| `sheets.values.batchGet` | `spreadsheets.readonly` | Read multiple cell ranges in one call |
 
 ## Admin setup
 
@@ -102,6 +105,7 @@ Enable the Google APIs matching your enabled capabilities in the same GCP projec
 - **Google Drive API** for `drive.readonly` / `drive`
 - **Gmail API** for `gmail.readonly` / `gmail.send`
 - **Google Calendar API** for `calendar.readonly` / `calendar.events`
+- **Google Sheets API** for `spreadsheets.readonly` / `spreadsheets`
 
 APIs that aren't enabled will return a 403 with a direct link to the GCP console to enable them.
 
@@ -138,7 +142,7 @@ Power users can add a system prompt instruction to call `gws_authorize` up front
 
 ## Limitations
 
-- **Readonly only (for now).** Drive, Gmail, and Calendar all have readonly action handlers. Write capabilities (sending email, creating events, editing files) are declared in the capability registry but have no action handlers yet. Adding them is additive — new entries in `ACTIONS` and new handler functions.
+- **Readonly only (for now).** Drive, Gmail, Calendar, and Sheets all have readonly action handlers. Write capabilities (sending email, creating events, editing files) are declared in the capability registry but have no action handlers yet. Adding them is additive — new entries in `ACTIONS` and new handler functions.
 - **~1 hour token lifetime.** Access tokens from `access_type=online` expire in about an hour. For long chats, the LLM will see `AUTH_EXPIRED` and re-trigger authorization. This is consistent with the per-chat consent model.
 - **Orphaned routes on tool deletion.** OWUI has no `on_delete` hook, so the callback route persists until server restart.
 - **Single-page export for Sheets.** `drive.files.get` exports the first sheet as CSV via Drive export. Full multi-sheet access requires the Sheets API (future `spreadsheets.*` actions).

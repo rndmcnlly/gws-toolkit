@@ -132,59 +132,75 @@ ACTIONS = {
     "drive.files.search": (
         "drive.readonly",
         "_action_drive_search",
-        "Search Drive for files matching a text query",
+        "Search Drive files. Params: query (str, required)",
     ),
     "drive.files.get": (
         "drive.readonly",
         "_action_drive_read",
-        "Read a Drive file by ID (exports Docs as markdown, Sheets as CSV, Slides as text)",
+        "Read a Drive file (exports Docs as markdown, Sheets as CSV, Slides as text). Params: fileId (str, required)",
     ),
     "drive.files.list": (
         "drive.readonly",
         "_action_drive_list",
-        "List files in a Drive folder",
+        "List files in a Drive folder. Params: folderId (str, default 'root')",
     ),
     # --- Gmail (readonly) ---
     "gmail.messages.search": (
         "gmail.readonly",
         "_action_gmail_messages_search",
-        "Search Gmail messages (uses Gmail search syntax: from:, subject:, after:, etc.)",
+        "Search Gmail messages (uses Gmail search syntax: from:, subject:, after:, etc.). Params: query (str), maxResults (int, default 10)",
     ),
     "gmail.messages.get": (
         "gmail.readonly",
         "_action_gmail_messages_get",
-        "Read a single Gmail message by ID (decodes body to text)",
+        "Read a single Gmail message with decoded body. Params: messageId (str, required)",
     ),
     "gmail.threads.list": (
         "gmail.readonly",
         "_action_gmail_threads_list",
-        "Search Gmail threads (returns thread snippets)",
+        "Search Gmail threads. Params: query (str), maxResults (int, default 10)",
     ),
     "gmail.threads.get": (
         "gmail.readonly",
         "_action_gmail_threads_get",
-        "Read all messages in a Gmail thread",
+        "Read all messages in a Gmail thread. Params: threadId (str, required)",
     ),
     # --- Calendar (readonly) ---
     "calendar.calendars.list": (
         "calendar.readonly",
         "_action_calendar_calendars_list",
-        "List the user's calendars (primary, shared, subscribed)",
+        "List the user's calendars (primary, shared, subscribed). Params: (none)",
     ),
     "calendar.events.list": (
         "calendar.readonly",
         "_action_calendar_events_list",
-        "List or search calendar events (supports time range and text query)",
+        "List or search calendar events. Params: calendarId (str, default 'primary'), q (str), timeMin (ISO 8601, defaults to now), timeMax (ISO 8601), maxResults (int, default 20)",
     ),
     "calendar.events.get": (
         "calendar.readonly",
         "_action_calendar_events_get",
-        "Get full details of a single calendar event",
+        "Get full details of a calendar event. Params: eventId (str, required), calendarId (str, default 'primary')",
     ),
     "calendar.freebusy.query": (
         "calendar.readonly",
         "_action_calendar_freebusy_query",
-        "Check free/busy status across calendars for a time range",
+        "Check free/busy status for a time range. Params: timeMin (ISO 8601, required), timeMax (ISO 8601, required), calendarIds (list or comma-separated str, default ['primary'])",
+    ),
+    # --- Sheets (readonly) ---
+    "sheets.spreadsheets.get": (
+        "spreadsheets.readonly",
+        "_action_sheets_spreadsheets_get",
+        "Get spreadsheet metadata: sheet names, row/column counts, named ranges. Params: spreadsheetId (str, required)",
+    ),
+    "sheets.values.get": (
+        "spreadsheets.readonly",
+        "_action_sheets_values_get",
+        "Read a cell range as rows of values. Params: spreadsheetId (str, required), range (str, required, e.g. 'Sheet1!A1:D20')",
+    ),
+    "sheets.values.batchGet": (
+        "spreadsheets.readonly",
+        "_action_sheets_values_batch_get",
+        "Read multiple cell ranges in one call. Params: spreadsheetId (str, required), ranges (list of str, required, e.g. ['Sheet1!A1:B5', 'Sheet2!C1:C100'])",
     ),
     # Future actions go here.  Each entry automatically appears in the
     # gws_action docstring and is gated by its required capability.
@@ -417,35 +433,90 @@ def _build_auth_url(
 
 
 # ---------------------------------------------------------------------------
-# Action handlers  (all receive token, params; return string)
+# Action handler helpers
+# ---------------------------------------------------------------------------
+
+
+def _require(params: dict, *names: str) -> str | None:
+    """Return an error string if any required param is missing, else None."""
+    missing = [n for n in names if not params.get(n)]
+    if missing:
+        return f"ERROR: Required parameter(s): {', '.join(missing)}"
+    return None
+
+
+async def _gws_get(url: str, token: str, app, user_id, chat_id,
+                   params: dict = None) -> tuple[dict | None, str | None]:
+    """GET a Google API URL. Returns (json, None) or (None, error_string)."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, params=params,
+                                headers={"Authorization": f"Bearer {token}"})
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return None, "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code == 404:
+        return None, "NOT_FOUND: The requested resource was not found."
+    if resp.status_code != 200:
+        return None, f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+    return resp.json(), None
+
+
+async def _gws_post(url: str, token: str, app, user_id, chat_id,
+                    body: dict = None) -> tuple[dict | None, str | None]:
+    """POST to a Google API URL. Returns (json, None) or (None, error_string)."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, json=body,
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return None, "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code == 404:
+        return None, "NOT_FOUND: The requested resource was not found."
+    if resp.status_code != 200:
+        return None, f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+    return resp.json(), None
+
+
+async def _gws_get_raw(url: str, token: str, app, user_id, chat_id,
+                       params: dict = None) -> tuple[str | None, int, str | None]:
+    """GET returning raw text (for file content). Returns (text, status, error)."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, params=params,
+                                headers={"Authorization": f"Bearer {token}"})
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return None, 401, "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code != 200:
+        return None, resp.status_code, f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+    return resp.text, 200, None
+
+
+# ---------------------------------------------------------------------------
+# Action handlers
 # ---------------------------------------------------------------------------
 
 
 async def _action_drive_search(token: str, params: dict, app, user_id, chat_id) -> str:
     """Search Drive for files matching a text query."""
-    query = params.get("query", "")
-    if not query:
-        return "ERROR: 'query' parameter is required."
+    err = _require(params, "query")
+    if err:
+        return err
 
+    query = params["query"]
     safe_q = query.replace("\\", "\\\\").replace("'", "\\'")
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://www.googleapis.com/drive/v3/files",
-            params={
-                "q": f"fullText contains '{safe_q}' and trashed=false",
-                "pageSize": 10,
-                "fields": "files(id,name,mimeType,webViewLink,modifiedTime)",
-                "orderBy": "modifiedTime desc",
-            },
-            headers={"Authorization": f"Bearer {token}"})
+    data, err = await _gws_get(
+        "https://www.googleapis.com/drive/v3/files",
+        token, app, user_id, chat_id, params={
+            "q": f"fullText contains '{safe_q}' and trashed=false",
+            "pageSize": 10,
+            "fields": "files(id,name,mimeType,webViewLink,modifiedTime)",
+            "orderBy": "modifiedTime desc",
+        })
+    if err:
+        return err
 
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    files = resp.json().get("files", [])
+    files = data.get("files", [])
     if not files:
         return f"NO_RESULTS: No files matching '{query}'."
 
@@ -461,78 +532,65 @@ async def _action_drive_search(token: str, params: dict, app, user_id, chat_id) 
 
 async def _action_drive_read(token: str, params: dict, app, user_id, chat_id) -> str:
     """Read a Drive file by ID."""
-    file_id = params.get("file_id", "")
-    if not file_id:
-        return "ERROR: 'file_id' parameter is required."
+    err = _require(params, "fileId")
+    if err:
+        return err
+    file_id = params["fileId"]
 
-    headers = {"Authorization": f"Bearer {token}"}
-    async with httpx.AsyncClient() as client:
-        meta_r = await client.get(
+    meta, err = await _gws_get(
+        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+        token, app, user_id, chat_id, params={"fields": "id,name,mimeType,size"})
+    if err:
+        return err
+
+    name = meta.get("name", "Untitled")
+    mime = meta.get("mimeType", "")
+
+    export_map = {
+        "application/vnd.google-apps.document": "text/markdown",
+        "application/vnd.google-apps.spreadsheet": "text/csv",
+        "application/vnd.google-apps.presentation": "text/plain",
+    }
+
+    if mime in export_map:
+        text, _, err = await _gws_get_raw(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
+            token, app, user_id, chat_id, params={"mimeType": export_map[mime]})
+    elif mime.startswith("text/") or mime == "application/json":
+        text, _, err = await _gws_get_raw(
             f"https://www.googleapis.com/drive/v3/files/{file_id}",
-            params={"fields": "id,name,mimeType,size"}, headers=headers)
+            token, app, user_id, chat_id, params={"alt": "media"})
+    elif mime == "application/pdf":
+        return (f"FILE_INFO: '{name}' is a PDF (no text extraction). "
+                f"Link: https://drive.google.com/file/d/{file_id}/view")
+    else:
+        return (f"FILE_INFO: '{name}' ({mime}) cannot be read as text. "
+                f"Link: https://drive.google.com/file/d/{file_id}/view")
 
-        if meta_r.status_code == 401:
-            _clear_chat_token(app, user_id, chat_id)
-            return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-        if meta_r.status_code != 200:
-            return f"API_ERROR: {meta_r.text[:300]}"
+    if err:
+        return err
 
-        meta = meta_r.json()
-        name = meta.get("name", "Untitled")
-        mime = meta.get("mimeType", "")
-
-        export_map = {
-            "application/vnd.google-apps.document": ("text/markdown", "md"),
-            "application/vnd.google-apps.spreadsheet": ("text/csv", "csv"),
-            "application/vnd.google-apps.presentation": ("text/plain", "txt"),
-        }
-
-        if mime in export_map:
-            export_mime = export_map[mime][0]
-            resp = await client.get(
-                f"https://www.googleapis.com/drive/v3/files/{file_id}/export",
-                params={"mimeType": export_mime}, headers=headers)
-        elif mime.startswith("text/") or mime == "application/json":
-            resp = await client.get(
-                f"https://www.googleapis.com/drive/v3/files/{file_id}",
-                params={"alt": "media"}, headers=headers)
-        elif mime == "application/pdf":
-            return (f"FILE_INFO: '{name}' is a PDF (no text extraction). "
-                    f"Link: https://drive.google.com/file/d/{file_id}/view")
-        else:
-            return (f"FILE_INFO: '{name}' ({mime}) cannot be read as text. "
-                    f"Link: https://drive.google.com/file/d/{file_id}/view")
-
-        if resp.status_code != 200:
-            return f"API_ERROR: {resp.text[:300]}"
-
-        content = resp.text[:16384]
-        trunc = " (TRUNCATED)" if len(resp.text) > 16384 else ""
-        return f"FILE_CONTENT: name='{name}'{trunc}\n\n{content}"
+    content = text[:16384]
+    trunc = " (TRUNCATED)" if len(text) > 16384 else ""
+    return f"FILE_CONTENT: name='{name}'{trunc}\n\n{content}"
 
 
 async def _action_drive_list(token: str, params: dict, app, user_id, chat_id) -> str:
     """List files in a Drive folder."""
-    folder_id = params.get("folder_id", "root")
+    folder_id = params.get("folderId", "root")
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://www.googleapis.com/drive/v3/files",
-            params={
-                "q": f"'{folder_id}' in parents and trashed=false",
-                "pageSize": 50,
-                "fields": "files(id,name,mimeType,modifiedTime)",
-                "orderBy": "folder,name",
-            },
-            headers={"Authorization": f"Bearer {token}"})
+    data, err = await _gws_get(
+        "https://www.googleapis.com/drive/v3/files",
+        token, app, user_id, chat_id, params={
+            "q": f"'{folder_id}' in parents and trashed=false",
+            "pageSize": 50,
+            "fields": "files(id,name,mimeType,modifiedTime)",
+            "orderBy": "folder,name",
+        })
+    if err:
+        return err
 
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    files = resp.json().get("files", [])
+    files = data.get("files", [])
     if not files:
         return "EMPTY: Folder contains no items."
 
@@ -644,91 +702,68 @@ def _format_message_full(msg: dict) -> str:
 async def _action_gmail_messages_search(token: str, params: dict, app, user_id, chat_id) -> str:
     """Search Gmail messages using Gmail search syntax."""
     query = params.get("query", "")
-    max_results = min(int(params.get("max_results", 10)), 20)
+    max_results = min(int(params.get("maxResults", 10)), 20)
 
     api_params = {"userId": "me", "maxResults": max_results}
     if query:
         api_params["q"] = query
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-            params=api_params,
-            headers={"Authorization": f"Bearer {token}"})
+    data, err = await _gws_get(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        token, app, user_id, chat_id, params=api_params)
+    if err:
+        return err
 
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    message_stubs = resp.json().get("messages", [])
+    message_stubs = data.get("messages", [])
     if not message_stubs:
         return f"NO_RESULTS: No messages matching '{query}'."
 
-    # Fetch metadata for each message (batched sequentially — Gmail has no
-    # batch endpoint in the REST API without multipart, keep it simple)
+    # Fetch metadata for each message sequentially
     results = []
-    async with httpx.AsyncClient() as client:
-        for stub in message_stubs:
-            msg_resp = await client.get(
-                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{stub['id']}",
-                params={"format": "metadata",
-                        "metadataHeaders": ["From", "Subject", "Date"]},
-                headers={"Authorization": f"Bearer {token}"})
-            if msg_resp.status_code == 200:
-                msg = msg_resp.json()
-                msg["snippet"] = msg.get("snippet", "")
-                results.append(_format_message_summary(msg))
+    for stub in message_stubs:
+        msg, err = await _gws_get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{stub['id']}",
+            token, app, user_id, chat_id,
+            params={"format": "metadata",
+                    "metadataHeaders": ["From", "Subject", "Date"]})
+        if msg:
+            msg["snippet"] = msg.get("snippet", "")
+            results.append(_format_message_summary(msg))
 
     return f"RESULTS: {len(results)} message(s):\n" + "\n".join(results)
 
 
 async def _action_gmail_messages_get(token: str, params: dict, app, user_id, chat_id) -> str:
     """Read a single Gmail message by ID."""
-    message_id = params.get("message_id", "")
-    if not message_id:
-        return "ERROR: 'message_id' parameter is required."
+    err = _require(params, "messageId")
+    if err:
+        return err
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
-            params={"format": "full"},
-            headers={"Authorization": f"Bearer {token}"})
+    data, err = await _gws_get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{params['messageId']}",
+        token, app, user_id, chat_id, params={"format": "full"})
+    if err:
+        return err
 
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code == 404:
-        return f"NOT_FOUND: Message '{message_id}' not found."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    return "MESSAGE:\n" + _format_message_full(resp.json())
+    return "MESSAGE:\n" + _format_message_full(data)
 
 
 async def _action_gmail_threads_list(token: str, params: dict, app, user_id, chat_id) -> str:
     """Search Gmail threads."""
     query = params.get("query", "")
-    max_results = min(int(params.get("max_results", 10)), 20)
+    max_results = min(int(params.get("maxResults", 10)), 20)
 
     api_params = {"userId": "me", "maxResults": max_results}
     if query:
         api_params["q"] = query
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://gmail.googleapis.com/gmail/v1/users/me/threads",
-            params=api_params,
-            headers={"Authorization": f"Bearer {token}"})
+    data, err = await _gws_get(
+        "https://gmail.googleapis.com/gmail/v1/users/me/threads",
+        token, app, user_id, chat_id, params=api_params)
+    if err:
+        return err
 
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    threads = resp.json().get("threads", [])
+    threads = data.get("threads", [])
     if not threads:
         return f"NO_RESULTS: No threads matching '{query}'."
 
@@ -742,25 +777,17 @@ async def _action_gmail_threads_list(token: str, params: dict, app, user_id, cha
 
 async def _action_gmail_threads_get(token: str, params: dict, app, user_id, chat_id) -> str:
     """Read all messages in a Gmail thread."""
-    thread_id = params.get("thread_id", "")
-    if not thread_id:
-        return "ERROR: 'thread_id' parameter is required."
+    err = _require(params, "threadId")
+    if err:
+        return err
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}",
-            params={"format": "full"},
-            headers={"Authorization": f"Bearer {token}"})
+    data, err = await _gws_get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{params['threadId']}",
+        token, app, user_id, chat_id, params={"format": "full"})
+    if err:
+        return err
 
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code == 404:
-        return f"NOT_FOUND: Thread '{thread_id}' not found."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    messages = resp.json().get("messages", [])
+    messages = data.get("messages", [])
     if not messages:
         return "EMPTY: Thread contains no messages."
 
@@ -852,19 +879,13 @@ def _format_event_full(event: dict) -> str:
 
 async def _action_calendar_calendars_list(token: str, params: dict, app, user_id, chat_id) -> str:
     """List the user's calendars."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://www.googleapis.com/calendar/v3/users/me/calendarList",
-            params={"maxResults": 100},
-            headers={"Authorization": f"Bearer {token}"})
+    data, err = await _gws_get(
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+        token, app, user_id, chat_id, params={"maxResults": 100})
+    if err:
+        return err
 
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    calendars = resp.json().get("items", [])
+    calendars = data.get("items", [])
     if not calendars:
         return "EMPTY: No calendars found."
 
@@ -879,11 +900,11 @@ async def _action_calendar_calendars_list(token: str, params: dict, app, user_id
 
 async def _action_calendar_events_list(token: str, params: dict, app, user_id, chat_id) -> str:
     """List or search calendar events."""
-    calendar_id = params.get("calendar_id", "primary")
-    query = params.get("query", "")
-    time_min = params.get("time_min", "")
-    time_max = params.get("time_max", "")
-    max_results = min(int(params.get("max_results", 20)), 50)
+    calendar_id = params.get("calendarId", "primary")
+    query = params.get("q", "")
+    time_min = params.get("timeMin", "")
+    time_max = params.get("timeMax", "")
+    max_results = min(int(params.get("maxResults", 20)), 50)
 
     # Default time_min to now — without this, singleEvents=true expands
     # recurring events from their origin (e.g. birthday events from birth
@@ -903,19 +924,13 @@ async def _action_calendar_events_list(token: str, params: dict, app, user_id, c
     if time_max:
         api_params["timeMax"] = time_max
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
-            params=api_params,
-            headers={"Authorization": f"Bearer {token}"})
+    data, err = await _gws_get(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+        token, app, user_id, chat_id, params=api_params)
+    if err:
+        return err
 
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    events = resp.json().get("items", [])
+    events = data.get("items", [])
     if not events:
         return "NO_RESULTS: No events found for the given criteria."
 
@@ -925,59 +940,42 @@ async def _action_calendar_events_list(token: str, params: dict, app, user_id, c
 
 async def _action_calendar_events_get(token: str, params: dict, app, user_id, chat_id) -> str:
     """Get full details of a single calendar event."""
-    event_id = params.get("event_id", "")
-    if not event_id:
-        return "ERROR: 'event_id' parameter is required."
-    calendar_id = params.get("calendar_id", "primary")
+    err = _require(params, "eventId")
+    if err:
+        return err
+    calendar_id = params.get("calendarId", "primary")
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
-            headers={"Authorization": f"Bearer {token}"})
+    data, err = await _gws_get(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{params['eventId']}",
+        token, app, user_id, chat_id)
+    if err:
+        return err
 
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code == 404:
-        return f"NOT_FOUND: Event '{event_id}' not found."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    return "EVENT:\n" + _format_event_full(resp.json())
+    return "EVENT:\n" + _format_event_full(data)
 
 
 async def _action_calendar_freebusy_query(token: str, params: dict, app, user_id, chat_id) -> str:
     """Check free/busy status across calendars for a time range."""
-    time_min = params.get("time_min", "")
-    time_max = params.get("time_max", "")
+    time_min = params.get("timeMin", "")
+    time_max = params.get("timeMax", "")
     if not time_min or not time_max:
-        return "ERROR: 'time_min' and 'time_max' parameters are required (ISO 8601, e.g. '2026-04-03T09:00:00-07:00')."
+        return "ERROR: 'timeMin' and 'timeMax' parameters are required (ISO 8601, e.g. '2026-04-03T09:00:00-07:00')."
 
     # Default to primary calendar if none specified
-    calendar_ids = params.get("calendar_ids", ["primary"])
+    calendar_ids = params.get("calendarIds", ["primary"])
     if isinstance(calendar_ids, str):
         calendar_ids = [c.strip() for c in calendar_ids.split(",")]
 
-    body = {
-        "timeMin": time_min,
-        "timeMax": time_max,
-        "items": [{"id": cid} for cid in calendar_ids],
-    }
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://www.googleapis.com/calendar/v3/freeBusy",
-            json=body,
-            headers={"Authorization": f"Bearer {token}",
-                     "Content-Type": "application/json"})
-
-    if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
-        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
-    if resp.status_code != 200:
-        return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
-
-    data = resp.json()
+    data, err = await _gws_post(
+        "https://www.googleapis.com/calendar/v3/freeBusy",
+        token, app, user_id, chat_id,
+        body={
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "items": [{"id": cid} for cid in calendar_ids],
+        })
+    if err:
+        return err
     calendars = data.get("calendars", {})
 
     lines = [f"FREE/BUSY: {time_min} to {time_max}\n"]
@@ -997,6 +995,147 @@ async def _action_calendar_freebusy_query(token: str, params: dict, app, user_id
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Sheets action handlers
+# ---------------------------------------------------------------------------
+
+SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
+
+
+async def _action_sheets_spreadsheets_get(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Get spreadsheet metadata: sheet names, dimensions, named ranges."""
+    err = _require(params, "spreadsheetId")
+    if err:
+        return err
+    spreadsheet_id = params["spreadsheetId"]
+
+    data, err = await _gws_get(
+        f"{SHEETS_API}/{spreadsheet_id}",
+        token, app, user_id, chat_id,
+        params={"fields": "spreadsheetId,properties.title,sheets.properties,namedRanges"})
+    if err:
+        return err
+    title = data.get("properties", {}).get("title", "(untitled)")
+    sheets = data.get("sheets", [])
+    named_ranges = data.get("namedRanges", [])
+
+    lines = [f"SPREADSHEET: {title} ({spreadsheet_id})", ""]
+    lines.append(f"Sheets ({len(sheets)}):")
+    for s in sheets:
+        props = s.get("properties", {})
+        name = props.get("title", "?")
+        grid = props.get("gridProperties", {})
+        rows = grid.get("rowCount", "?")
+        cols = grid.get("columnCount", "?")
+        sheet_id = props.get("sheetId", "?")
+        lines.append(f"  - {name} | {rows} rows x {cols} cols | sheetId={sheet_id}")
+
+    if named_ranges:
+        lines.append(f"\nNamed ranges ({len(named_ranges)}):")
+        for nr in named_ranges:
+            name = nr.get("name", "?")
+            r = nr.get("range", {})
+            lines.append(f"  - {name} → sheetId={r.get('sheetId', '?')} "
+                         f"rows {r.get('startRowIndex', '?')}:{r.get('endRowIndex', '?')} "
+                         f"cols {r.get('startColumnIndex', '?')}:{r.get('endColumnIndex', '?')}")
+
+    return "\n".join(lines)
+
+
+def _format_values_grid(values: list, range_label: str = "") -> str:
+    """Format a 2D values array as a readable aligned table."""
+    if not values:
+        return f"{range_label}: (empty)" if range_label else "(empty range)"
+
+    # Compute column widths
+    max_cols = max(len(row) for row in values)
+    widths = [0] * max_cols
+    for row in values:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    # Cap column widths at 40 chars for readability
+    widths = [min(w, 40) for w in widths]
+
+    lines = []
+    if range_label:
+        lines.append(f"{range_label} ({len(values)} rows):")
+
+    for row_idx, row in enumerate(values):
+        cells = []
+        for i in range(max_cols):
+            val = str(row[i]) if i < len(row) else ""
+            if len(val) > 40:
+                val = val[:37] + "..."
+            cells.append(val.ljust(widths[i]))
+        lines.append("  " + " | ".join(cells))
+
+        # Separator after first row (headers)
+        if row_idx == 0:
+            lines.append("  " + "-+-".join("-" * w for w in widths))
+
+        # Truncate output for very large ranges
+        if row_idx >= 99:
+            lines.append(f"  ... ({len(values) - 100} more rows)")
+            break
+
+    return "\n".join(lines)
+
+
+async def _action_sheets_values_get(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Read a cell range from a spreadsheet."""
+    err = _require(params, "spreadsheetId", "range")
+    if err:
+        return err
+    spreadsheet_id = params["spreadsheetId"]
+    range_ = params["range"]
+
+    data, err = await _gws_get(
+        f"{SHEETS_API}/{spreadsheet_id}/values/{range_}",
+        token, app, user_id, chat_id,
+        params={"valueRenderOption": "FORMATTED_VALUE"})
+    if err:
+        return err
+    values = data.get("values", [])
+    actual_range = data.get("range", range_)
+
+    return _format_values_grid(values, actual_range)
+
+
+async def _action_sheets_values_batch_get(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Read multiple cell ranges from a spreadsheet in one call."""
+    err = _require(params, "spreadsheetId", "ranges")
+    if err:
+        return err
+    spreadsheet_id = params["spreadsheetId"]
+    ranges = params["ranges"]
+    if isinstance(ranges, str):
+        ranges = [r.strip() for r in ranges.split(",")]
+
+    # httpx handles repeated params via list of tuples
+    param_tuples = [("valueRenderOption", "FORMATTED_VALUE")]
+    for r in ranges:
+        param_tuples.append(("ranges", r))
+
+    data, err = await _gws_get(
+        f"{SHEETS_API}/{spreadsheet_id}/values:batchGet",
+        token, app, user_id, chat_id, params=param_tuples)
+    if err:
+        return err
+    value_ranges = data.get("valueRanges", [])
+
+    if not value_ranges:
+        return "NO_RESULTS: No data returned for the requested ranges."
+
+    parts = []
+    for vr in value_ranges:
+        actual_range = vr.get("range", "?")
+        values = vr.get("values", [])
+        parts.append(_format_values_grid(values, actual_range))
+
+    return "\n\n".join(parts)
+
+
 # Handler lookup (module-level functions by name)
 _ACTION_HANDLERS = {
     "_action_drive_search": _action_drive_search,
@@ -1010,6 +1149,9 @@ _ACTION_HANDLERS = {
     "_action_calendar_events_list": _action_calendar_events_list,
     "_action_calendar_events_get": _action_calendar_events_get,
     "_action_calendar_freebusy_query": _action_calendar_freebusy_query,
+    "_action_sheets_spreadsheets_get": _action_sheets_spreadsheets_get,
+    "_action_sheets_values_get": _action_sheets_values_get,
+    "_action_sheets_values_batch_get": _action_sheets_values_batch_get,
 }
 
 
