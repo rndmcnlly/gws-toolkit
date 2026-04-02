@@ -1154,12 +1154,10 @@ class Tools:
         cap_desc = ", ".join(
             f"{c} ({CAPABILITIES[c][1]})" for c in sorted(needed))
         return (
-            f"AUTH_REQUIRED: The user must open this URL to grant access for "
-            f"this chat session:\n\n{url}\n\n"
+            f"AUTH_REQUIRED: Present this link to the user:\n\n"
+            f"[Authorize Google Workspace access]({url})\n\n"
             f"Capabilities requested: {cap_desc}\n\n"
-            f"This grants access only for the current chat. "
-            f"The user can revoke it at any time from "
-            f"https://myaccount.google.com/permissions"
+            f"This grants access only for the current chat."
         )
 
     # -------------------------------------------------------------------
