@@ -4,7 +4,7 @@ author: Adam Smith
 author_url: https://github.com/rndmcnlly/gws-toolkit
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available.
 required_open_webui_version: 0.4.0
-version: 0.6.0
+version: 0.6.1
 licence: MIT
 requirements: httpx
 """
@@ -26,7 +26,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.6.0"
+TOOL_VERSION = "0.6.1"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -1215,6 +1215,65 @@ async def _action_sheets_values_batch_get(token: str, params: dict, app, user_id
         parts.append(_format_values_grid(values, actual_range))
 
     return "\n\n".join(parts)
+
+
+@action("sheets.values.update", cap="spreadsheets")
+async def _action_sheets_values_update(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Write values to a cell range (overwrites existing data). Params: spreadsheetId (str, required), range (str, required, A1 notation e.g. 'Sheet1!A1:C3'), values (list of lists, required — each inner list is a row), valueInputOption (str, default 'USER_ENTERED' — use 'RAW' to store strings literally)"""
+    err = _require(params, "spreadsheetId", "range", "values")
+    if err:
+        return err
+    spreadsheet_id = params["spreadsheetId"]
+    range_ = params["range"]
+    values = params["values"]
+    value_input = params.get("valueInputOption", "USER_ENTERED")
+
+    data, err = await _gws_request(
+        "PUT", f"{SHEETS_API}/{spreadsheet_id}/values/{range_}",
+        token, app, user_id, chat_id,
+        params={"valueInputOption": value_input},
+        body={"range": range_, "majorDimension": "ROWS", "values": values})
+    if err:
+        return err
+
+    return (
+        f"UPDATED: {data.get('updatedRange', range_)} — "
+        f"{data.get('updatedRows', '?')} rows, "
+        f"{data.get('updatedColumns', '?')} columns, "
+        f"{data.get('updatedCells', '?')} cells updated."
+    )
+
+
+@action("sheets.values.append", cap="spreadsheets")
+async def _action_sheets_values_append(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Append rows after the last row of a table detected in the range. Params: spreadsheetId (str, required), range (str, required, A1 notation — defines where to search for the table, e.g. 'Sheet1!A:C'), values (list of lists, required — each inner list is a row), valueInputOption (str, default 'USER_ENTERED'), insertDataOption (str, default 'INSERT_ROWS' — use 'OVERWRITE' to write over cells below the table)"""
+    err = _require(params, "spreadsheetId", "range", "values")
+    if err:
+        return err
+    spreadsheet_id = params["spreadsheetId"]
+    range_ = params["range"]
+    values = params["values"]
+    value_input = params.get("valueInputOption", "USER_ENTERED")
+    insert_opt = params.get("insertDataOption", "INSERT_ROWS")
+
+    data, err = await _gws_request(
+        "POST", f"{SHEETS_API}/{spreadsheet_id}/values/{range_}:append",
+        token, app, user_id, chat_id,
+        params={"valueInputOption": value_input, "insertDataOption": insert_opt},
+        body={"range": range_, "majorDimension": "ROWS", "values": values})
+    if err:
+        return err
+
+    updates = data.get("updates", {})
+    table_range = data.get("tableRange", "")
+    updated_range = updates.get("updatedRange", "?")
+    updated_rows = updates.get("updatedRows", "?")
+    updated_cells = updates.get("updatedCells", "?")
+
+    result = f"APPENDED: {updated_rows} rows, {updated_cells} cells written at {updated_range}."
+    if table_range:
+        result += f" Table detected at {table_range}."
+    return result
 
 
 
