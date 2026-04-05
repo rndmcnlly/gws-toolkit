@@ -1,10 +1,10 @@
 """
 title: Google Workspace
 author: Adam Smith
-author_url: https://adamsmith.as
+author_url: https://github.com/rndmcnlly/gws-toolkit
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available.
 required_open_webui_version: 0.4.0
-version: 0.5.0
+version: 0.6.0
 licence: MIT
 requirements: httpx
 """
@@ -26,7 +26,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.5.0"
+TOOL_VERSION = "0.6.0"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -55,9 +55,9 @@ CAPABILITIES = {
         "https://www.googleapis.com/auth/gmail.readonly",
         "Read Gmail messages and threads",
     ),
-    "gmail.send": (
-        "https://www.googleapis.com/auth/gmail.send",
-        "Send email on behalf of the user",
+    "gmail.compose": (
+        "https://www.googleapis.com/auth/gmail.compose",
+        "Create and manage email drafts",
     ),
     "calendar.readonly": (
         "https://www.googleapis.com/auth/calendar.readonly",
@@ -227,9 +227,30 @@ def _routes_version(client_id: str, client_secret: str, base_url: str) -> str:
 
 
 def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
-    """Register the OAuth callback.  Skips if already current."""
+    """Register the OAuth callback.  Skips if already current.
+
+    Detects duplicate toolkit deployments that would collide on the same
+    callback route prefix and raises early rather than silently clobbering.
+    """
     version_key = f"__{TOOL_ID}_route_version__"
+    owner_key = f"__{TOOL_ID}_route_owner__"
     target = _routes_version(client_id, client_secret, base_url)
+
+    # Derive a stable owner identity from the valves configuration.
+    # Two copies with identical valves are indistinguishable (and harmless);
+    # two copies with *different* valves would fight over routes.
+    owner = target  # hash of version + credentials + base_url
+
+    existing_owner = getattr(app.state, owner_key, None)
+    if existing_owner is not None and existing_owner != owner:
+        # Another toolkit instance with different configuration already owns
+        # these routes.  Clobbering would break OAuth for the other copy.
+        raise RuntimeError(
+            f"Route conflict: another deployment of {TOOL_ID} with different "
+            f"configuration already registered {CALLBACK_PATH}.  "
+            f"Delete the duplicate toolkit in the OWUI admin panel."
+        )
+
     if getattr(app.state, version_key, None) == target:
         return
     _strip_tool_routes(app)
@@ -306,6 +327,7 @@ def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
 
     _insert_route_before_spa(app, CALLBACK_PATH, oauth_callback, methods=["GET"])
     setattr(app.state, version_key, target)
+    setattr(app.state, owner_key, owner)
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +736,144 @@ async def _action_gmail_threads_get(token: str, params: dict, app, user_id, chat
     if len(result) > 32768:
         result = result[:32768] + "\n\n(TRUNCATED)"
     return result
+
+
+# ---------------------------------------------------------------------------
+# Gmail draft action handlers
+# ---------------------------------------------------------------------------
+
+GMAIL_DRAFTS_API = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
+
+
+def _build_rfc2822_base64(to: str, subject: str, body: str,
+                          cc: str = "", bcc: str = "",
+                          in_reply_to: str = "", references: str = "") -> str:
+    """Build an RFC 2822 message and return it as a URL-safe base64 string.
+
+    Uses email.message.EmailMessage from stdlib for correct header encoding
+    (handles non-ASCII subjects, long lines, etc.).
+    """
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["To"] = to
+    msg["Subject"] = subject
+    if cc:
+        msg["Cc"] = cc
+    if bcc:
+        msg["Bcc"] = bcc
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
+    msg.set_content(body)
+    raw_bytes = msg.as_bytes()
+    return base64.urlsafe_b64encode(raw_bytes).decode("ascii")
+
+
+@action("gmail.drafts.create", cap="gmail.compose")
+async def _action_gmail_drafts_create(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Create a Gmail draft (does NOT send). Params: to (str, required), subject (str, required), body (str, required), cc (str), bcc (str), threadId (str — set to reply within an existing thread), inReplyTo (str — Message-ID header of the message being replied to), references (str — References header for threading)"""
+    err = _require(params, "to", "subject", "body")
+    if err:
+        return err
+
+    raw = _build_rfc2822_base64(
+        to=params["to"],
+        subject=params["subject"],
+        body=params["body"],
+        cc=params.get("cc", ""),
+        bcc=params.get("bcc", ""),
+        in_reply_to=params.get("inReplyTo", ""),
+        references=params.get("references", ""),
+    )
+
+    request_body = {"message": {"raw": raw}}
+    if params.get("threadId"):
+        request_body["message"]["threadId"] = params["threadId"]
+
+    data, err = await _gws_request(
+        "POST", GMAIL_DRAFTS_API,
+        token, app, user_id, chat_id, body=request_body)
+    if err:
+        return err
+
+    draft_id = data.get("id", "?")
+    msg_data = data.get("message", {})
+    thread_id = msg_data.get("threadId", "")
+
+    return (
+        f"DRAFT_CREATED: Draft saved successfully.\n"
+        f"  draftId={draft_id}\n"
+        f"  threadId={thread_id}\n"
+        f"The user can review and send it from Gmail."
+    )
+
+
+@action("gmail.drafts.list", cap="gmail.readonly")
+async def _action_gmail_drafts_list(token: str, params: dict, app, user_id, chat_id) -> str:
+    """List Gmail drafts. Params: query (str — Gmail search syntax), maxResults (int, default 10)"""
+    max_results = min(int(params.get("maxResults", 10)), 20)
+    api_params = {"userId": "me", "maxResults": max_results}
+    q = params.get("query", "")
+    if q:
+        api_params["q"] = q
+
+    data, err = await _gws_request(
+        "GET", GMAIL_DRAFTS_API,
+        token, app, user_id, chat_id, params=api_params)
+    if err:
+        return err
+
+    drafts = data.get("drafts", [])
+    if not drafts:
+        return "NO_RESULTS: No drafts found."
+
+    # Fetch summary metadata for each draft
+    lines = []
+    for d in drafts:
+        draft_id = d.get("id", "?")
+        msg_stub = d.get("message", {})
+        msg_id = msg_stub.get("id", "")
+
+        if msg_id:
+            msg, _ = await _gws_request(
+                "GET", f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                token, app, user_id, chat_id,
+                params={"format": "metadata",
+                        "metadataHeaders": ["To", "Subject", "Date"]})
+            if msg:
+                headers = msg.get("payload", {}).get("headers", [])
+                to = _extract_header(headers, "To")
+                subject = _extract_header(headers, "Subject")
+                snippet = msg.get("snippet", "")
+                lines.append(
+                    f"- draftId={draft_id} | to={to} | subject={subject}\n"
+                    f"  {snippet[:120]}")
+                continue
+
+        lines.append(f"- draftId={draft_id} | (no metadata)")
+
+    return f"RESULTS: {len(drafts)} draft(s):\n" + "\n".join(lines)
+
+
+@action("gmail.drafts.get", cap="gmail.readonly")
+async def _action_gmail_drafts_get(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Read a specific Gmail draft with decoded body. Params: draftId (str, required)"""
+    err = _require(params, "draftId")
+    if err:
+        return err
+
+    data, err = await _gws_request(
+        "GET", f"{GMAIL_DRAFTS_API}/{params['draftId']}",
+        token, app, user_id, chat_id, params={"format": "full"})
+    if err:
+        return err
+
+    msg = data.get("message", {})
+    if not msg:
+        return "ERROR: Draft contains no message data."
+
+    return f"DRAFT (id={data.get('id', '?')}):\n" + _format_message_full(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -1199,7 +1359,9 @@ class Tools:
         cap_desc = ", ".join(
             f"{c} ({CAPABILITIES[c][1]})" for c in sorted(needed))
         return (
-            f"AUTH_REQUIRED: Present this link to the user:\n\n"
+            f"AUTH_REQUIRED: The user must click the link below to authorize.\n"
+            f"IMPORTANT: You MUST reproduce this link EXACTLY in your reply — "
+            f"the user cannot see tool outputs directly.\n\n"
             f"[Authorize Google Workspace access]({url})\n\n"
             f"Capabilities requested: {cap_desc}\n\n"
             f"This grants access only for the current chat."
