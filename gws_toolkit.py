@@ -4,7 +4,7 @@ author: Adam Smith
 author_url: https://github.com/rndmcnlly/gws-toolkit
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available.
 required_open_webui_version: 0.4.0
-version: 0.6.2
+version: 0.6.3
 licence: MIT
 requirements: httpx
 """
@@ -27,7 +27,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.6.2"
+TOOL_VERSION = "0.6.3"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -409,7 +409,7 @@ async def _gws_request(
 
 @action("drive.files.search", cap="drive.readonly")
 async def _action_drive_search(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Search Drive files. Params: query (str, required)"""
+    """Search Drive files. Ref: https://developers.google.com/drive/api/reference/rest/v3/files/list Params: query (str, required)"""
     err = _require(params, "query")
     if err:
         return err
@@ -443,7 +443,7 @@ async def _action_drive_search(token: str, params: dict, app, user_id, chat_id) 
 
 @action("drive.files.get", cap="drive.readonly")
 async def _action_drive_read(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read a Drive file (exports Docs as markdown, Sheets as CSV, Slides as text). Params: fileId (str, required)"""
+    """Read a Drive file (exports Docs as markdown, Sheets as CSV, Slides as text). Ref: https://developers.google.com/drive/api/reference/rest/v3/files/get Params: fileId (str, required)"""
     err = _require(params, "fileId")
     if err:
         return err
@@ -489,7 +489,7 @@ async def _action_drive_read(token: str, params: dict, app, user_id, chat_id) ->
 
 @action("drive.files.list", cap="drive.readonly")
 async def _action_drive_list(token: str, params: dict, app, user_id, chat_id) -> str:
-    """List files in a Drive folder. Params: folderId (str, default 'root')"""
+    """List files in a Drive folder. Ref: https://developers.google.com/drive/api/reference/rest/v3/files/list Params: folderId (str, default 'root')"""
     folder_id = params.get("folderId", "root")
 
     data, err = await _gws_request(
@@ -614,7 +614,7 @@ def _format_message_full(msg: dict) -> str:
 
 @action("gmail.messages.search", cap="gmail.readonly")
 async def _action_gmail_messages_search(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Search Gmail messages (uses Gmail search syntax: from:, subject:, after:, etc.). Params: query (str), maxResults (int, default 10)"""
+    """Search Gmail messages (uses Gmail search syntax: from:, subject:, after:, etc.). Ref: https://developers.google.com/gmail/api/reference/rest/v1/users.messages/list Params: query (str), maxResults (int, default 10)"""
     query = params.get("query", "")
     max_results = min(int(params.get("maxResults", 10)), 20)
 
@@ -649,7 +649,7 @@ async def _action_gmail_messages_search(token: str, params: dict, app, user_id, 
 
 @action("gmail.messages.get", cap="gmail.readonly")
 async def _action_gmail_messages_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read a single Gmail message with decoded body. Params: messageId (str, required)"""
+    """Read a single Gmail message with decoded body. Ref: https://developers.google.com/gmail/api/reference/rest/v1/users.messages/get Params: messageId (str, required)"""
     err = _require(params, "messageId")
     if err:
         return err
@@ -665,7 +665,7 @@ async def _action_gmail_messages_get(token: str, params: dict, app, user_id, cha
 
 @action("gmail.threads.list", cap="gmail.readonly")
 async def _action_gmail_threads_list(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Search Gmail threads. Params: query (str), maxResults (int, default 10)"""
+    """Search Gmail threads. Ref: https://developers.google.com/gmail/api/reference/rest/v1/users.threads/list Params: query (str), maxResults (int, default 10)"""
     query = params.get("query", "")
     max_results = min(int(params.get("maxResults", 10)), 20)
 
@@ -693,7 +693,7 @@ async def _action_gmail_threads_list(token: str, params: dict, app, user_id, cha
 
 @action("gmail.threads.get", cap="gmail.readonly")
 async def _action_gmail_threads_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read all messages in a Gmail thread. Params: threadId (str, required)"""
+    """Read all messages in a Gmail thread. Ref: https://developers.google.com/gmail/api/reference/rest/v1/users.threads/get Params: threadId (str, required)"""
     err = _require(params, "threadId")
     if err:
         return err
@@ -753,7 +753,7 @@ def _build_rfc2822_base64(to: str, subject: str, body: str,
 
 @action("gmail.drafts.create", cap="gmail.compose")
 async def _action_gmail_drafts_create(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Create a Gmail draft (does NOT send). Params: to (str, required), subject (str, required), body (str, required), cc (str), bcc (str), threadId (str — set to reply within an existing thread), inReplyTo (str — Message-ID header of the message being replied to), references (str — References header for threading)"""
+    """Create a Gmail draft (does NOT send). Ref: https://developers.google.com/gmail/api/reference/rest/v1/users.drafts/create Params: to (str, required), subject (str, required), body (str, required), cc (str), bcc (str), threadId (str — set to reply within an existing thread), inReplyTo (str — Message-ID header of the message being replied to), references (str — References header for threading)"""
     err = _require(params, "to", "subject", "body")
     if err:
         return err
@@ -792,7 +792,7 @@ async def _action_gmail_drafts_create(token: str, params: dict, app, user_id, ch
 
 @action("gmail.drafts.list", cap="gmail.readonly")
 async def _action_gmail_drafts_list(token: str, params: dict, app, user_id, chat_id) -> str:
-    """List Gmail drafts. Params: query (str — Gmail search syntax), maxResults (int, default 10)"""
+    """List Gmail drafts. Ref: https://developers.google.com/gmail/api/reference/rest/v1/users.drafts/list Params: query (str — Gmail search syntax), maxResults (int, default 10)"""
     max_results = min(int(params.get("maxResults", 10)), 20)
     api_params = {"userId": "me", "maxResults": max_results}
     q = params.get("query", "")
@@ -839,7 +839,7 @@ async def _action_gmail_drafts_list(token: str, params: dict, app, user_id, chat
 
 @action("gmail.drafts.get", cap="gmail.readonly")
 async def _action_gmail_drafts_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read a specific Gmail draft with decoded body. Params: draftId (str, required)"""
+    """Read a specific Gmail draft with decoded body. Ref: https://developers.google.com/gmail/api/reference/rest/v1/users.drafts/get Params: draftId (str, required)"""
     err = _require(params, "draftId")
     if err:
         return err
@@ -934,7 +934,7 @@ def _format_event_full(event: dict) -> str:
 
 @action("calendar.calendars.list", cap="calendar.readonly")
 async def _action_calendar_calendars_list(token: str, params: dict, app, user_id, chat_id) -> str:
-    """List the user's calendars (primary, shared, subscribed). Params: (none)"""
+    """List the user's calendars (primary, shared, subscribed). Ref: https://developers.google.com/calendar/api/v3/reference/calendarList/list Params: (none)"""
     data, err = await _gws_request(
         "GET", "https://www.googleapis.com/calendar/v3/users/me/calendarList",
         token, app, user_id, chat_id, params={"maxResults": 100})
@@ -956,7 +956,7 @@ async def _action_calendar_calendars_list(token: str, params: dict, app, user_id
 
 @action("calendar.events.list", cap="calendar.readonly")
 async def _action_calendar_events_list(token: str, params: dict, app, user_id, chat_id) -> str:
-    """List or search calendar events. Params: calendarId (str, default 'primary'), q (str), timeMin (ISO 8601, defaults to now), timeMax (ISO 8601), maxResults (int, default 20)"""
+    """List or search calendar events. Ref: https://developers.google.com/calendar/api/v3/reference/events/list Params: calendarId (str, default 'primary'), q (str), timeMin (ISO 8601, defaults to now), timeMax (ISO 8601), maxResults (int, default 20)"""
     calendar_id = params.get("calendarId", "primary")
     query = params.get("q", "")
     time_min = params.get("timeMin", "")
@@ -997,7 +997,7 @@ async def _action_calendar_events_list(token: str, params: dict, app, user_id, c
 
 @action("calendar.events.get", cap="calendar.readonly")
 async def _action_calendar_events_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Get full details of a calendar event. Params: eventId (str, required), calendarId (str, default 'primary')"""
+    """Get full details of a calendar event. Ref: https://developers.google.com/calendar/api/v3/reference/events/get Params: eventId (str, required), calendarId (str, default 'primary')"""
     err = _require(params, "eventId")
     if err:
         return err
@@ -1014,7 +1014,7 @@ async def _action_calendar_events_get(token: str, params: dict, app, user_id, ch
 
 @action("calendar.freebusy.query", cap="calendar.readonly")
 async def _action_calendar_freebusy_query(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Check free/busy status for a time range. Params: timeMin (ISO 8601, required), timeMax (ISO 8601, required), calendarIds (list or comma-separated str, default ['primary'])"""
+    """Check free/busy status for a time range. Ref: https://developers.google.com/calendar/api/v3/reference/freebusy/query Params: timeMin (ISO 8601, required), timeMax (ISO 8601, required), calendarIds (list or comma-separated str, default ['primary'])"""
     time_min = params.get("timeMin", "")
     time_max = params.get("timeMax", "")
     if not time_min or not time_max:
@@ -1059,7 +1059,7 @@ CALENDAR_EVENTS_API = "https://www.googleapis.com/calendar/v3/calendars"
 
 @action("calendar.events.create", cap="calendar.events")
 async def _action_calendar_events_create(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Create a calendar event. Params: calendarId (str, default 'primary'), summary (str, required — event title), start (object, required — e.g. {"dateTime": "2026-04-10T10:00:00-07:00"} or {"date": "2026-04-10"} for all-day), end (object, required — same format as start), description (str), location (str), attendees (list of {"email": "..."}), recurrence (list of RRULE strings, e.g. ["RRULE:FREQ=WEEKLY;COUNT=5"]), sendUpdates (str — 'all', 'externalOnly', or 'none', default 'none')"""
+    """Create a calendar event. Ref: https://developers.google.com/calendar/api/v3/reference/events/insert Params: calendarId (str, default 'primary'), summary (str, required — event title), start (object, required — e.g. {"dateTime": "2026-04-10T10:00:00-07:00"} or {"date": "2026-04-10"} for all-day), end (object, required — same format as start), description (str), location (str), attendees (list of {"email": "..."}), recurrence (list of RRULE strings, e.g. ["RRULE:FREQ=WEEKLY;COUNT=5"]), sendUpdates (str — 'all', 'externalOnly', or 'none', default 'none')"""
     err = _require(params, "summary", "start", "end")
     if err:
         return err
@@ -1081,7 +1081,7 @@ async def _action_calendar_events_create(token: str, params: dict, app, user_id,
 
 @action("calendar.events.patch", cap="calendar.events")
 async def _action_calendar_events_patch(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Update specific fields of an existing calendar event (patch semantics — only include fields to change). Params: eventId (str, required), calendarId (str, default 'primary'), sendUpdates (str — 'all', 'externalOnly', or 'none', default 'none'), plus any Event fields to update: summary (str), start (object), end (object), description (str), location (str), attendees (list of {"email": "..."}), recurrence (list of RRULE strings), etc."""
+    """Update specific fields of an existing calendar event (patch semantics — only include fields to change). Ref: https://developers.google.com/calendar/api/v3/reference/events/patch Params: eventId (str, required), calendarId (str, default 'primary'), sendUpdates (str — 'all', 'externalOnly', or 'none', default 'none'), plus any Event fields to update: summary (str), start (object), end (object), description (str), location (str), attendees (list of {"email": "..."}), recurrence (list of RRULE strings), etc."""
     err = _require(params, "eventId")
     if err:
         return err
@@ -1103,7 +1103,7 @@ async def _action_calendar_events_patch(token: str, params: dict, app, user_id, 
 
 @action("calendar.events.delete", cap="calendar.events")
 async def _action_calendar_events_delete(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Delete a calendar event. Params: eventId (str, required), calendarId (str, default 'primary'), sendUpdates (str — 'all', 'externalOnly', or 'none', default 'none')"""
+    """Delete a calendar event. Ref: https://developers.google.com/calendar/api/v3/reference/events/delete Params: eventId (str, required), calendarId (str, default 'primary'), sendUpdates (str — 'all', 'externalOnly', or 'none', default 'none')"""
     err = _require(params, "eventId")
     if err:
         return err
@@ -1140,7 +1140,7 @@ SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
 
 @action("sheets.spreadsheets.get", cap="spreadsheets.readonly")
 async def _action_sheets_spreadsheets_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Get spreadsheet metadata: sheet names, row/column counts, named ranges. Params: spreadsheetId (str, required)"""
+    """Get spreadsheet metadata: sheet names, row/column counts, named ranges. Ref: https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets/get Params: spreadsheetId (str, required)"""
     err = _require(params, "spreadsheetId")
     if err:
         return err
@@ -1221,7 +1221,7 @@ def _format_values_grid(values: list, range_label: str = "") -> str:
 
 @action("sheets.values.get", cap="spreadsheets.readonly")
 async def _action_sheets_values_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read a cell range as rows of values. Params: spreadsheetId (str, required), range (str, required, e.g. 'Sheet1!A1:D20')"""
+    """Read a cell range as rows of values. Ref: https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.values/get Params: spreadsheetId (str, required), range (str, required, e.g. 'Sheet1!A1:D20')"""
     err = _require(params, "spreadsheetId", "range")
     if err:
         return err
@@ -1242,7 +1242,7 @@ async def _action_sheets_values_get(token: str, params: dict, app, user_id, chat
 
 @action("sheets.values.batchGet", cap="spreadsheets.readonly")
 async def _action_sheets_values_batch_get(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Read multiple cell ranges in one call. Params: spreadsheetId (str, required), ranges (list of str, required, e.g. ['Sheet1!A1:B5', 'Sheet2!C1:C100'])"""
+    """Read multiple cell ranges in one call. Ref: https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.values/batchGet Params: spreadsheetId (str, required), ranges (list of str, required, e.g. ['Sheet1!A1:B5', 'Sheet2!C1:C100'])"""
     err = _require(params, "spreadsheetId", "ranges")
     if err:
         return err
@@ -1277,7 +1277,7 @@ async def _action_sheets_values_batch_get(token: str, params: dict, app, user_id
 
 @action("sheets.values.update", cap="spreadsheets")
 async def _action_sheets_values_update(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Write values to a cell range (overwrites existing data). Params: spreadsheetId (str, required), range (str, required, A1 notation e.g. 'Sheet1!A1:C3'), values (list of lists, required — each inner list is a row), valueInputOption (str, default 'USER_ENTERED' — use 'RAW' to store strings literally)"""
+    """Write values to a cell range (overwrites existing data). Ref: https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.values/update Params: spreadsheetId (str, required), range (str, required, A1 notation e.g. 'Sheet1!A1:C3'), values (list of lists, required — each inner list is a row), valueInputOption (str, default 'USER_ENTERED' — use 'RAW' to store strings literally)"""
     err = _require(params, "spreadsheetId", "range", "values")
     if err:
         return err
@@ -1304,7 +1304,7 @@ async def _action_sheets_values_update(token: str, params: dict, app, user_id, c
 
 @action("sheets.values.append", cap="spreadsheets")
 async def _action_sheets_values_append(token: str, params: dict, app, user_id, chat_id) -> str:
-    """Append rows after the last row of a table detected in the range. Params: spreadsheetId (str, required), range (str, required, A1 notation — defines where to search for the table, e.g. 'Sheet1!A:C'), values (list of lists, required — each inner list is a row), valueInputOption (str, default 'USER_ENTERED'), insertDataOption (str, default 'INSERT_ROWS' — use 'OVERWRITE' to write over cells below the table)"""
+    """Append rows after the last row of a table detected in the range. Ref: https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.values/append Params: spreadsheetId (str, required), range (str, required, A1 notation — defines where to search for the table, e.g. 'Sheet1!A:C'), values (list of lists, required — each inner list is a row), valueInputOption (str, default 'USER_ENTERED'), insertDataOption (str, default 'INSERT_ROWS' — use 'OVERWRITE' to write over cells below the table)"""
     err = _require(params, "spreadsheetId", "range", "values")
     if err:
         return err
