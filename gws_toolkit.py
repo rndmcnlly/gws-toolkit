@@ -4,12 +4,13 @@ author: Adam Smith
 author_url: https://github.com/rndmcnlly/gws-toolkit
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available.
 required_open_webui_version: 0.4.0
-version: 0.6.1
+version: 0.6.2
 licence: MIT
 requirements: httpx
 """
 
 import base64
+from datetime import datetime, timezone
 import hashlib
 import html as html_mod
 import httpx
@@ -26,7 +27,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.6.1"
+TOOL_VERSION = "0.6.2"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -221,36 +222,17 @@ def _clear_chat_token(app, user_id: str, chat_id: str):
 
 
 def _routes_version(client_id: str, client_secret: str, base_url: str) -> str:
+    # Intentionally excludes TOOL_VERSION — routes only need re-registration
+    # when credentials or base URL change, not on code updates.
     h = hashlib.sha256(
-        f"{TOOL_VERSION}:{client_id}:{client_secret}:{base_url}".encode())
+        f"{client_id}:{client_secret}:{base_url}".encode())
     return h.hexdigest()[:12]
 
 
 def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
-    """Register the OAuth callback.  Skips if already current.
-
-    Detects duplicate toolkit deployments that would collide on the same
-    callback route prefix and raises early rather than silently clobbering.
-    """
+    """Register the OAuth callback.  Skips if already current."""
     version_key = f"__{TOOL_ID}_route_version__"
-    owner_key = f"__{TOOL_ID}_route_owner__"
     target = _routes_version(client_id, client_secret, base_url)
-
-    # Derive a stable owner identity from the valves configuration.
-    # Two copies with identical valves are indistinguishable (and harmless);
-    # two copies with *different* valves would fight over routes.
-    owner = target  # hash of version + credentials + base_url
-
-    existing_owner = getattr(app.state, owner_key, None)
-    if existing_owner is not None and existing_owner != owner:
-        # Another toolkit instance with different configuration already owns
-        # these routes.  Clobbering would break OAuth for the other copy.
-        raise RuntimeError(
-            f"Route conflict: another deployment of {TOOL_ID} with different "
-            f"configuration already registered {CALLBACK_PATH}.  "
-            f"Delete the duplicate toolkit in the OWUI admin panel."
-        )
-
     if getattr(app.state, version_key, None) == target:
         return
     _strip_tool_routes(app)
@@ -327,7 +309,6 @@ def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
 
     _insert_route_before_spa(app, CALLBACK_PATH, oauth_callback, methods=["GET"])
     setattr(app.state, version_key, target)
-    setattr(app.state, owner_key, owner)
 
 
 # ---------------------------------------------------------------------------
@@ -1073,6 +1054,83 @@ async def _action_calendar_freebusy_query(token: str, params: dict, app, user_id
     return "\n".join(lines)
 
 
+CALENDAR_EVENTS_API = "https://www.googleapis.com/calendar/v3/calendars"
+
+
+@action("calendar.events.create", cap="calendar.events")
+async def _action_calendar_events_create(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Create a calendar event. Params: calendarId (str, default 'primary'), summary (str, required — event title), start (object, required — e.g. {"dateTime": "2026-04-10T10:00:00-07:00"} or {"date": "2026-04-10"} for all-day), end (object, required — same format as start), description (str), location (str), attendees (list of {"email": "..."}), recurrence (list of RRULE strings, e.g. ["RRULE:FREQ=WEEKLY;COUNT=5"]), sendUpdates (str — 'all', 'externalOnly', or 'none', default 'none')"""
+    err = _require(params, "summary", "start", "end")
+    if err:
+        return err
+
+    calendar_id = params.pop("calendarId", "primary")
+    send_updates = params.pop("sendUpdates", "none")
+
+    # Everything remaining in params becomes the event body
+    data, err = await _gws_request(
+        "POST", f"{CALENDAR_EVENTS_API}/{calendar_id}/events",
+        token, app, user_id, chat_id,
+        params={"sendUpdates": send_updates},
+        body=params)
+    if err:
+        return err
+
+    return "EVENT_CREATED:\n" + _format_event_full(data)
+
+
+@action("calendar.events.patch", cap="calendar.events")
+async def _action_calendar_events_patch(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Update specific fields of an existing calendar event (patch semantics — only include fields to change). Params: eventId (str, required), calendarId (str, default 'primary'), sendUpdates (str — 'all', 'externalOnly', or 'none', default 'none'), plus any Event fields to update: summary (str), start (object), end (object), description (str), location (str), attendees (list of {"email": "..."}), recurrence (list of RRULE strings), etc."""
+    err = _require(params, "eventId")
+    if err:
+        return err
+
+    calendar_id = params.pop("calendarId", "primary")
+    event_id = params.pop("eventId")
+    send_updates = params.pop("sendUpdates", "none")
+
+    data, err = await _gws_request(
+        "PATCH", f"{CALENDAR_EVENTS_API}/{calendar_id}/events/{event_id}",
+        token, app, user_id, chat_id,
+        params={"sendUpdates": send_updates},
+        body=params)
+    if err:
+        return err
+
+    return "EVENT_UPDATED:\n" + _format_event_full(data)
+
+
+@action("calendar.events.delete", cap="calendar.events")
+async def _action_calendar_events_delete(token: str, params: dict, app, user_id, chat_id) -> str:
+    """Delete a calendar event. Params: eventId (str, required), calendarId (str, default 'primary'), sendUpdates (str — 'all', 'externalOnly', or 'none', default 'none')"""
+    err = _require(params, "eventId")
+    if err:
+        return err
+
+    calendar_id = params.get("calendarId", "primary")
+    event_id = params["eventId"]
+    send_updates = params.get("sendUpdates", "none")
+
+    # DELETE returns 204 with no body; _gws_request expects 200,
+    # so we handle this directly.
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient() as client:
+        resp = await client.delete(
+            f"{CALENDAR_EVENTS_API}/{calendar_id}/events/{event_id}",
+            params={"sendUpdates": send_updates},
+            headers=headers)
+
+    if resp.status_code == 204:
+        return f"EVENT_DELETED: Event {event_id} has been deleted."
+    if resp.status_code == 401:
+        _clear_chat_token(app, user_id, chat_id)
+        return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
+    if resp.status_code == 404:
+        return f"NOT_FOUND: Event {event_id} was not found."
+    return f"API_ERROR: {resp.status_code}: {resp.text[:300]}"
+
+
 # ---------------------------------------------------------------------------
 # Sheets action handlers
 # ---------------------------------------------------------------------------
@@ -1376,6 +1434,11 @@ class Tools:
         admin_caps = _parse_caps(self.valves.enabled_capabilities)
         requested = _parse_caps(capabilities)
 
+        # Ground the LLM's sense of current time (see issue #2).
+        # Lands in message history, not the tool spec, so KV-cache-safe.
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        time_line = f"  Current server time (UTC): {now}"
+
         # Empty request → status introspection
         if not requested:
             existing = _get_chat_token(app, user_id, __chat_id__)
@@ -1388,6 +1451,7 @@ class Tools:
             else:
                 lines.append("  Authorized in this chat: (none)")
             lines.append(f"  Admin-allowed capabilities: {', '.join(available)}")
+            lines.append(time_line)
             return "\n".join(lines)
 
         disallowed = requested - admin_caps
@@ -1395,7 +1459,8 @@ class Tools:
             return (
                 f"NOT_ENABLED: Capability {', '.join(sorted(disallowed))} "
                 f"not enabled by admin. "
-                f"Admin-enabled capabilities: {', '.join(sorted(admin_caps))}"
+                f"Admin-enabled capabilities: {', '.join(sorted(admin_caps))}\n"
+                f"{time_line}"
             )
 
         # Check which of the requested caps are already granted in this chat
@@ -1407,7 +1472,8 @@ class Tools:
                 granted_list = ", ".join(sorted(already))
                 return (
                     f"ALREADY_AUTHORIZED: This chat already has access to: {granted_list}. "
-                    f"No additional authorization needed."
+                    f"No additional authorization needed.\n"
+                    f"{time_line}"
                 )
         else:
             needed = requested
@@ -1423,7 +1489,8 @@ class Tools:
             f"the user cannot see tool outputs directly.\n\n"
             f"[Authorize Google Workspace access]({url})\n\n"
             f"Capabilities requested: {cap_desc}\n\n"
-            f"This grants access only for the current chat."
+            f"This grants access only for the current chat.\n"
+            f"{time_line}"
         )
 
     # -------------------------------------------------------------------
