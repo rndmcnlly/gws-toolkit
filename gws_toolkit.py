@@ -2,9 +2,9 @@
 title: Google Workspace
 author: Adam Smith
 author_url: https://github.com/rndmcnlly/gws-toolkit
-description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available.
+description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available. Uses OWUI event emitters for self-contained OAuth authorization.
 required_open_webui_version: 0.4.0
-version: 0.6.3
+version: 0.7.0
 licence: MIT
 requirements: httpx
 """
@@ -27,7 +27,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.6.3"
+TOOL_VERSION = "0.7.0"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -301,11 +301,24 @@ def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
 
         cap_list = ", ".join(sorted(merged_caps)) if merged_caps else "(none recognized)"
         return HTMLResponse(
-            f"<h2>Google Workspace access granted</h2>"
-            f"<p>Capabilities: {cap_list}</p>"
-            f"<p>This access is for the current chat only. "
-            f"You can close this tab and return to the chat.</p>"
-            f"<script>window.close()</script>")
+            "<html><head><style>"
+            "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+            "display:flex;justify-content:center;align-items:center;min-height:100vh;"
+            "margin:0;background:#f9fafb;color:#111827}"
+            ".card{background:#fff;border-radius:12px;padding:2.5rem 3rem;"
+            "box-shadow:0 1px 3px rgba(0,0,0,.1);text-align:center;max-width:420px}"
+            ".check{font-size:3rem;margin-bottom:.5rem}"
+            "h2{margin:0 0 .5rem;font-size:1.25rem}"
+            ".caps{color:#6b7280;font-size:.875rem;margin-bottom:1rem}"
+            ".hint{color:#9ca3af;font-size:.8rem}"
+            "</style></head><body><div class='card'>"
+            "<div class='check'>&#10003;</div>"
+            f"<h2>Access granted</h2>"
+            f"<div class='caps'>{cap_list}</div>"
+            f"<div class='hint'>This access is for the current chat only.<br>"
+            f"You can close this tab and return to the chat.</div>"
+            "</div></body></html>"
+            "<script>window.close()</script>")
 
     _insert_route_before_spa(app, CALLBACK_PATH, oauth_callback, methods=["GET"])
     setattr(app.state, version_key, target)
@@ -1404,6 +1417,7 @@ class Tools:
         __user__: dict = {},
         __chat_id__: str = "",
         __request__=None,
+        __event_call__=None,
     ) -> str:
         """
         Request Google Workspace authorization for this chat, or inspect
@@ -1434,8 +1448,6 @@ class Tools:
         admin_caps = _parse_caps(self.valves.enabled_capabilities)
         requested = _parse_caps(capabilities)
 
-        # Ground the LLM's sense of current time (see issue #2).
-        # Lands in message history, not the tool spec, so KV-cache-safe.
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         time_line = f"  Current server time (UTC): {now}"
 
@@ -1483,6 +1495,46 @@ class Tools:
 
         cap_desc = ", ".join(
             f"{c} ({CAPABILITIES[c][1]})" for c in sorted(needed))
+
+        # ------------------------------------------------------------------
+        # Event-based flow: modal dialog with clickable OAuth link,
+        # blocks until user confirms, then verifies the token was cached.
+        # ------------------------------------------------------------------
+        if __event_call__:
+            result = await __event_call__({
+                "type": "confirmation",
+                "data": {
+                    "title": "Google Workspace Authorization Required",
+                    "message": (
+                        f'Right-click (or ⌘+click) the link below to open it in a new tab, complete the Google consent, then return here and click Confirm.\n\n'
+                        f'<a href="{url}" rel="noopener" style="color: #4F46E5; font-weight: bold; text-decoration: underline;">Authorize Google Workspace access</a>\n\n'
+                        f'Capabilities: {cap_desc}\n\n'
+                        f'This grants access only for the current chat.'
+                    ),
+                },
+            })
+
+            if result:
+                token = _get_chat_token(app, user_id, __chat_id__)
+                if token and needed <= token.get("granted_caps", set()):
+                    all_granted = ", ".join(sorted(token.get("granted_caps", set())))
+                    return (
+                        f"AUTHORIZED: {all_granted} granted.\n"
+                        f"{time_line}"
+                    )
+                else:
+                    return (
+                        f"AUTH_INCOMPLETE: You confirmed but the token was not received. "
+                        f"Please complete the Google consent screen first, then try again.\n"
+                        f"{time_line}"
+                    )
+            else:
+                return f"AUTH_CANCELLED: User cancelled authorization.\n{time_line}"
+
+        # ------------------------------------------------------------------
+        # Legacy fallback: return link in tool output for LLM to reproduce.
+        # Used when __event_call__ is not available (API calls, etc.)
+        # ------------------------------------------------------------------
         return (
             f"AUTH_REQUIRED: The user must click the link below to authorize.\n"
             f"IMPORTANT: You MUST reproduce this link EXACTLY in your reply — "

@@ -15,23 +15,23 @@ Admin valves set a capability ceiling. Users can only authorize up to the admin-
 
 ```
 User in chat ──► LLM calls gws_action ──► Dispatcher checks:
-                                            1. Is this action's capability admin-enabled?
-                                            2. Does this chat have a token with that capability?
-                              ┌──────────── both yes ────────────┐
-                              │                                   │
-                              │ no                                ▼
-                              ▼                          Call Google API,
-                   Return AUTH_REQUIRED                  return results
-                   LLM calls gws_authorize
-                              │
-                              ▼
-                   Return consent URL to user
-                   User clicks ──► Google consent ──► callback endpoint
-                              │
-                              ▼
-                   Exchange code for access token
-                   Store in per-chat in-memory cache
-                   User retries request
+                                             1. Is this action's capability admin-enabled?
+                                             2. Does this chat have a token with that capability?
+                               ┌──────────── both yes ────────────┐
+                               │                                   │
+                               │ no                                ▼
+                               ▼                          Call Google API,
+                    Return AUTH_REQUIRED                  return results
+                    LLM calls gws_authorize
+                               │
+                               ▼
+                    Confirmation modal with OAuth link
+                    User right-clicks link → new tab → Google consent → callback
+                               │
+                               ▼
+                    User clicks Confirm in modal
+                    Tool verifies token was cached
+                    Returns AUTHORIZED or AUTH_INCOMPLETE
 ```
 
 Key properties:
@@ -168,11 +168,12 @@ In Workspace > Models, enable "Google Workspace" for any model that supports nat
 
 1. User asks something that needs Drive access (e.g. "find my budget spreadsheet")
 2. LLM calls `gws_action(action="drive.files.search", ...)`, gets `AUTH_REQUIRED`
-3. LLM calls `gws_authorize(capabilities="drive.readonly")`, gets a consent URL
-4. LLM presents the link in its reply, user clicks it, authorizes in a new tab
-5. Tab closes automatically, user retries their request
-6. Subsequent Drive requests in this chat work without re-authorization
-7. New chat → starts fresh, requires new consent
+3. LLM calls `gws_authorize(capabilities="drive.readonly")`, which shows a confirmation modal with the OAuth link
+4. User right-clicks (or ⌘+clicks) the link to open it in a new tab, completes Google consent, tab shows "access granted"
+5. User returns to the chat and clicks Confirm in the modal
+6. Tool verifies the token was cached, returns `AUTHORIZED`
+7. Subsequent Drive requests in this chat work without re-authorization
+8. New chat → starts fresh, requires new consent
 
 Power users can add a system prompt instruction to call `gws_authorize` up front with their preferred capability set.
 
