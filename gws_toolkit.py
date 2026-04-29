@@ -4,21 +4,21 @@ author: Adam Smith
 author_url: https://github.com/rndmcnlly/gws-toolkit
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available. Uses OWUI event emitters for self-contained OAuth authorization.
 required_open_webui_version: 0.4.0
-version: 0.7.1
+version: 0.7.2
 licence: MIT
-requirements: httpx
+requirements: httpx, beautifulsoup4, html5lib
 """
 
 import base64
 from datetime import datetime, timezone
 import hashlib
-import html as html_mod
 import httpx
 import json
 import re
 import secrets
 import time
 import urllib.parse
+from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -535,6 +535,24 @@ async def _action_drive_list(token: str, params: dict, app, user_id, chat_id) ->
 # ---------------------------------------------------------------------------
 
 
+def _html_to_text(html: str) -> str:
+    """Convert an HTML fragment to collapsed, readable plaintext.
+
+    Uses BeautifulSoup with the html5lib backend (a WHATWG-spec-compliant
+    parser) so browser-accepted quirks like `</script foo="bar">` and
+    `<!-- comment --!>` end markers are handled the same way a real browser
+    would. Output is plaintext for downstream agent consumption, not HTML
+    re-rendering, so the tag-filtering concerns of CWE-116 don't apply here;
+    a real parser is still the right tool.
+    """
+    soup = BeautifulSoup(html, "html5lib")
+    # Drop non-content elements entirely (their text should not leak through).
+    for tag in soup(["script", "style", "head", "title", "meta", "link"]):
+        tag.decompose()
+    # `separator=" "` ensures adjacent block tags don't smoosh their text together.
+    return re.sub(r"\s+", " ", soup.get_text(separator=" ")).strip()
+
+
 def _decode_mime_body(payload: dict) -> str:
     """Extract readable text from a Gmail message payload (recursive MIME walk)."""
     # Direct body on this part
@@ -547,13 +565,7 @@ def _decode_mime_body(payload: dict) -> str:
         if mime_type == "text/plain":
             return decoded
         if mime_type == "text/html":
-            # Strip HTML tags to get readable text
-            text = re.sub(r"<style[^>]*>.*?</style>", "", decoded, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
-            text = re.sub(r"<[^>]+>", " ", text)
-            text = html_mod.unescape(text)
-            text = re.sub(r"\s+", " ", text).strip()
-            return text
+            return _html_to_text(decoded)
         return decoded
 
     # Multipart — recurse, preferring text/plain
