@@ -4,7 +4,7 @@ author: Adam Smith
 author_url: https://github.com/rndmcnlly/gws-toolkit
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available. Uses OWUI event emitters for self-contained OAuth authorization.
 required_open_webui_version: 0.4.0
-version: 0.7.0
+version: 0.7.1
 licence: MIT
 requirements: httpx
 """
@@ -27,7 +27,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.7.0"
+TOOL_VERSION = "0.7.1"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -548,8 +548,8 @@ def _decode_mime_body(payload: dict) -> str:
             return decoded
         if mime_type == "text/html":
             # Strip HTML tags to get readable text
-            text = re.sub(r"<style[^>]*>.*?</style>", "", decoded, flags=re.DOTALL)
-            text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL)
+            text = re.sub(r"<style[^>]*>.*?</style>", "", decoded, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r"<[^>]+>", " ", text)
             text = html_mod.unescape(text)
             text = re.sub(r"\s+", " ", text).strip()
