@@ -4,7 +4,7 @@ author: Adam Smith
 author_url: https://github.com/rndmcnlly/gws-toolkit
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available. Uses OWUI event emitters for self-contained OAuth authorization.
 required_open_webui_version: 0.4.0
-version: 0.7.2
+version: 0.7.7
 licence: MIT
 requirements: httpx, beautifulsoup4, html5lib
 """
@@ -19,6 +19,12 @@ import secrets
 import time
 import urllib.parse
 from bs4 import BeautifulSoup
+# Request/HTMLResponse must be module-level, not imported inside _ensure_routes.
+# Under OWUI's tool loader, handler annotations are resolved as strings against
+# the module globals; a function-local import leaves "Request" unresolvable and
+# FastAPI then treats `request` as a required query param (422 on the callback).
+from fastapi import Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -27,7 +33,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.7.1"
+TOOL_VERSION = "0.7.7"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -222,10 +228,13 @@ def _clear_chat_token(app, user_id: str, chat_id: str):
 
 
 def _routes_version(client_id: str, client_secret: str, base_url: str) -> str:
-    # Intentionally excludes TOOL_VERSION — routes only need re-registration
-    # when credentials or base URL change, not on code updates.
+    # Includes TOOL_VERSION so any code update (e.g. a changed callback
+    # handler, or adapting to a new OWUI routing layer) forces _ensure_routes
+    # to strip and re-register. Without this, a tool update leaves the prior
+    # load's route bound in-process: an orphaned handler that can fail
+    # validation (observed as a 422 on the callback after an OWUI upgrade).
     h = hashlib.sha256(
-        f"{client_id}:{client_secret}:{base_url}".encode())
+        f"{TOOL_VERSION}:{client_id}:{client_secret}:{base_url}".encode())
     return h.hexdigest()[:12]
 
 
@@ -236,9 +245,6 @@ def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
     if getattr(app.state, version_key, None) == target:
         return
     _strip_tool_routes(app)
-
-    from fastapi import Request
-    from fastapi.responses import HTMLResponse
 
     redirect_uri = base_url.rstrip("/") + CALLBACK_PATH
 
