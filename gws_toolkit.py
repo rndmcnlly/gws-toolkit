@@ -4,7 +4,7 @@ author: Adam Smith
 author_url: https://github.com/rndmcnlly/gws-toolkit
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available. Uses OWUI event emitters for self-contained OAuth authorization.
 required_open_webui_version: 0.4.0
-version: 0.7.7
+version: 0.7.8
 licence: MIT
 requirements: httpx, beautifulsoup4, html5lib
 """
@@ -12,6 +12,7 @@ requirements: httpx, beautifulsoup4, html5lib
 import base64
 from datetime import datetime, timezone
 import hashlib
+import html
 import httpx
 import json
 import re
@@ -255,7 +256,8 @@ def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
 
         if error:
             return HTMLResponse(
-                f"<h2>Authorization failed</h2><p>{error}</p>", status_code=400)
+                f"<h2>Authorization failed</h2><p>{html.escape(error)}</p>",
+                status_code=400)
         if not code or not state:
             return HTMLResponse(
                 "<h2>Missing parameters</h2><p>Please try again from the chat.</p>",
@@ -283,7 +285,8 @@ def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
 
         if resp.status_code != 200:
             return HTMLResponse(
-                f"<h2>Token exchange failed</h2><pre>{resp.text[:500]}</pre>",
+                "<h2>Token exchange failed</h2>"
+                "<p>Please retry the authorization from the chat.</p>",
                 status_code=502)
 
         td = resp.json()
