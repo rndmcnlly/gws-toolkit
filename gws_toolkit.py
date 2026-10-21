@@ -4,12 +4,16 @@ author: Adam Smith
 author_url: https://github.com/rndmcnlly/gws-toolkit
 description: Per-user, per-chat OAuth2 access to Google Workspace APIs. Ephemeral tokens — every chat starts unauthorized. Admin valves control which capabilities are available. Uses OWUI event emitters for self-contained OAuth authorization.
 required_open_webui_version: 0.4.0
-version: 0.7.8
+version: 0.8.0-dev
 licence: MIT
 requirements: httpx, beautifulsoup4, html5lib
 """
 
 import base64
+import functools
+from contextvars import ContextVar
+import math
+import os
 from datetime import datetime, timezone
 import hashlib
 import html
@@ -34,7 +38,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 TOOL_ID = "gws_toolkit"
-TOOL_VERSION = "0.7.7"
+TOOL_VERSION = "0.8.0-dev"
 ROUTE_PREFIX = f"/api/v1/x/{TOOL_ID}"
 CALLBACK_PATH = f"{ROUTE_PREFIX}/oauth/callback"
 
@@ -176,7 +180,7 @@ def _strip_tool_routes(app):
 
 
 # ---------------------------------------------------------------------------
-# Ephemeral per-chat token cache  (in-process only, no DB)
+# Ephemeral per-chat authorization (OWUI Redis, or single-process memory)
 #
 # Key: (user_id, chat_id) -> {
 #     "access_token": str,
@@ -186,46 +190,211 @@ def _strip_tool_routes(app):
 # ---------------------------------------------------------------------------
 
 
-def _app_state_dict(app, suffix: str) -> dict:
-    """Lazy-init a named dict on app.state.  Lost on restart — by design."""
-    key = f"__{TOOL_ID}_{suffix}__"
-    d = getattr(app.state, key, None)
-    if d is None:
-        d = {}
-        setattr(app.state, key, d)
-    return d
+PENDING_TTL = 600
+_NAMESPACE = ContextVar("gws_authorization_namespace", default=None)
 
 
-def _token_cache(app) -> dict:
-    """Per-chat token cache."""
-    return _app_state_dict(app, "tokens")
+class _StateUnavailable(Exception):
+    pass
 
 
-def _pending_states(app) -> dict:
-    """OAuth state -> {user_id, chat_id} for in-flight flows."""
-    return _app_state_dict(app, "pending")
+class _AuthorizationPending(Exception):
+    pass
 
 
-def _get_chat_token(app, user_id: str, chat_id: str) -> Optional[dict]:
-    """Return the cached token entry for this chat, or None."""
-    entry = _token_cache(app).get((user_id, chat_id))
-    if not entry:
-        return None
-    if entry.get("expires_at", 0) <= time.time():
-        # Expired — remove it.  User will need to re-authorize.
-        _token_cache(app).pop((user_id, chat_id), None)
-        return None
-    return entry
+def _state_errors(fn):
+    """Keep backend errors and credentials out of model-visible exceptions."""
+    @functools.wraps(fn)
+    async def wrapped(*args, **kwargs):
+        previous = _NAMESPACE.set(None)
+        try:
+            return await fn(*args, **kwargs)
+        except _StateUnavailable:
+            return "AUTH_UNAVAILABLE: Authorization state is unavailable. Please retry later."
+        except _AuthorizationPending:
+            return "AUTH_PENDING: Finish or cancel the existing authorization for this chat, or wait ten minutes."
+        finally:
+            _NAMESPACE.reset(previous)
+    return wrapped
 
 
-def _clear_chat_token(app, user_id: str, chat_id: str):
-    """Remove cached token for this chat."""
-    _token_cache(app).pop((user_id, chat_id), None)
+def _state_key(app, kind: str, *parts: str) -> str:
+    namespace = _NAMESPACE.get() or getattr(app.state, "__gws_namespace__", None)
+    if not namespace:
+        raise _StateUnavailable()
+    # One deployment hash tag keeps multi-key scripts valid on Redis Cluster.
+    # Tuple encoding avoids delimiter collisions; OAuth config changes invalidate
+    # prior state. Operators sharing Redis must use distinct REDIS_KEY_PREFIXes.
+    prefix = os.environ.get("REDIS_KEY_PREFIX", "open-webui")
+    digest = hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode()).hexdigest()
+    return f"{prefix}:{{gws:{namespace}}}:{kind}:{digest}"
+
+
+def _memory(app) -> dict:
+    name = "__gws_ephemeral__"
+    entries = getattr(app.state, name, None)
+    if entries is None:
+        entries = {}
+        setattr(app.state, name, entries)
+    # Opportunistically reclaim expired flows/tokens, including abandoned consent.
+    now = time.time()
+    for key in [k for k, (expiry, _) in entries.items() if expiry <= now]:
+        del entries[key]
+    return entries
+
+
+async def _redis_call(app, method, *args, **kwargs):
+    try:
+        return await getattr(app.state.redis, method)(*args, **kwargs)
+    except Exception:
+        # A configured but unreachable backend must never become local state.
+        raise _StateUnavailable() from None
+
+
+async def _put_pending(app, nonce: str, flow: dict):
+    pending = _state_key(app, "pending", nonce)
+    active = _state_key(app, "active", flow["user_id"], flow["chat_id"])
+    if getattr(app.state, "redis", None) is None:
+        entries = _memory(app)
+        if active in entries:
+            raise _AuthorizationPending()
+        expiry = time.time() + PENDING_TTL
+        entries[active] = (expiry, nonce)
+        entries[pending] = (expiry, flow)
+    else:
+        acquired = await _redis_call(app, "eval", """
+            if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+            redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+            redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+            return 1
+        """, 2, active, pending, nonce, json.dumps(flow), PENDING_TTL)
+        if not acquired:
+            raise _AuthorizationPending()
+
+
+async def _pop_pending(app, nonce: str) -> Optional[dict]:
+    key = _state_key(app, "pending", nonce)
+    if getattr(app.state, "redis", None) is None:
+        entry = _memory(app).pop(key, None)
+        return entry[1] if entry else None
+    raw = await _redis_call(app, "getdel", key)
+    return json.loads(raw) if raw else None
+
+
+async def _finish_pending(app, nonce: str, flow: dict):
+    key = _state_key(app, "active", flow["user_id"], flow["chat_id"])
+    if getattr(app.state, "redis", None) is None:
+        entries = _memory(app)
+        if entries.get(key, (None, None))[1] == nonce:
+            entries.pop(key, None)
+    else:
+        await _redis_call(app, "eval", """
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+        """, 1, key, nonce)
+
+
+async def _put_token(app, user_id: str, chat_id: str, bundle: dict, nonce: str):
+    key = _state_key(app, "token", user_id, chat_id)
+    active = _state_key(app, "active", user_id, chat_id)
+    ttl_ms = int((bundle["expires_at"] - time.time()) * 1000)
+    if ttl_ms <= 0:
+        raise _StateUnavailable()
+    if getattr(app.state, "redis", None) is None:
+        entries = _memory(app)
+        if entries.get(active, (None, None))[1] != nonce:
+            raise _StateUnavailable()
+        entries[key] = (bundle["expires_at"], bundle)
+    else:
+        value = {**bundle, "granted_caps": sorted(bundle["granted_caps"])}
+        saved = await _redis_call(app, "eval", """
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+            redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
+            return 1
+        """, 2, active, key, nonce, json.dumps(value), ttl_ms)
+        if not saved:
+            raise _StateUnavailable()
+
+
+async def _get_chat_token(app, user_id: str, chat_id: str) -> Optional[dict]:
+    key = _state_key(app, "token", user_id, chat_id)
+    if getattr(app.state, "redis", None) is None:
+        entry = _memory(app).get(key)
+        bundle = entry[1] if entry else None
+    else:
+        raw = await _redis_call(app, "get", key)
+        bundle = json.loads(raw) if raw else None
+        if bundle:
+            bundle["granted_caps"] = set(bundle["granted_caps"])
+    return bundle if bundle and bundle["expires_at"] > time.time() else None
+
+
+async def _clear_chat_token(app, user_id: str, chat_id: str, rejected_token: str = None):
+    key = _state_key(app, "token", user_id, chat_id)
+    if getattr(app.state, "redis", None) is None:
+        entries = _memory(app)
+        entry = entries.get(key)
+        if entry and (rejected_token is None or entry[1]["access_token"] == rejected_token):
+            entries.pop(key, None)
+    else:
+        # A slow 401 for an old request must not revoke a newer authorization.
+        await _redis_call(app, "eval", """
+            local raw = redis.call('GET', KEYS[1])
+            if not raw then return 0 end
+            if ARGV[1] == '' or cjson.decode(raw).access_token == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+        """, 1, key, rejected_token or "")
 
 
 # ---------------------------------------------------------------------------
 # Route registration (version-stamped, idempotent)
 # ---------------------------------------------------------------------------
+
+
+async def _complete_authorization(request: Request, client_id, client_secret, redirect_uri):
+    state = request.query_params.get("state", "")
+    code = request.query_params.get("code")
+    error = request.query_params.get("error")
+    if not state or len(state) > 256 or (not code and not error):
+        return HTMLResponse("<h2>Missing authorization parameters</h2>", status_code=400)
+    flow = await _pop_pending(request.app, state)
+    if not flow:
+        return HTMLResponse("<h2>Expired or invalid state</h2>", status_code=400)
+    try:
+        if error:
+            return HTMLResponse("<h2>Authorization cancelled or denied</h2>", status_code=400)
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(GOOGLE_TOKEN_URL, data={
+                    "code": code, "client_id": client_id, "client_secret": client_secret,
+                    "redirect_uri": redirect_uri, "grant_type": "authorization_code",
+                })
+            if resp.status_code != 200:
+                raise ValueError("Token exchange rejected")
+            td = resp.json()
+            token = td.get("access_token")
+            lifetime = float(td.get("expires_in", 3600)) - 60
+            scope = td.get("scope", "")
+            if not isinstance(token, str) or not token or not isinstance(scope, str):
+                raise ValueError("Invalid token bundle")
+            if not math.isfinite(lifetime) or lifetime <= 0:
+                raise ValueError("Invalid token lifetime")
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+            return HTMLResponse("<h2>Token exchange failed. Please authorize again.</h2>", status_code=502)
+        granted = _caps_from_scopes(scope)
+        # Never union labels from another token. Request combined scopes up front,
+        # then retain only the scopes Google actually returned for this token.
+        await _put_token(request.app, flow["user_id"], flow["chat_id"], {
+            "access_token": token, "expires_at": time.time() + lifetime,
+            "granted_caps": granted,
+        }, state)
+        return granted
+    finally:
+        await _finish_pending(request.app, state, flow)
 
 
 def _routes_version(client_id: str, client_secret: str, base_url: str) -> str:
@@ -239,76 +408,22 @@ def _routes_version(client_id: str, client_secret: str, base_url: str) -> str:
     return h.hexdigest()[:12]
 
 
-def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
-    """Register the OAuth callback.  Skips if already current."""
-    version_key = f"__{TOOL_ID}_route_version__"
+def _callback_endpoint(client_id: str, client_secret: str, base_url: str):
+    """Bind a handler to a configuration snapshot, including across awaits."""
     target = _routes_version(client_id, client_secret, base_url)
-    if getattr(app.state, version_key, None) == target:
-        return
-    _strip_tool_routes(app)
-
     redirect_uri = base_url.rstrip("/") + CALLBACK_PATH
 
     async def oauth_callback(request: Request):
-        code = request.query_params.get("code")
-        state = request.query_params.get("state")
-        error = request.query_params.get("error")
-
-        if error:
-            return HTMLResponse(
-                f"<h2>Authorization failed</h2><p>{html.escape(error)}</p>",
-                status_code=400)
-        if not code or not state:
-            return HTMLResponse(
-                "<h2>Missing parameters</h2><p>Please try again from the chat.</p>",
-                status_code=400)
-
-        pending = _pending_states(request.app)
-        flow = pending.pop(state, None)
-        if not flow:
-            return HTMLResponse(
-                "<h2>Expired or invalid state</h2>"
-                "<p>Please start the authorization flow again from the chat.</p>",
-                status_code=400)
-
-        user_id = flow["user_id"]
-        chat_id = flow["chat_id"]
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(GOOGLE_TOKEN_URL, data={
-                "code": code,
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "redirect_uri": redirect_uri,
-                "grant_type": "authorization_code",
-            })
-
-        if resp.status_code != 200:
-            return HTMLResponse(
-                "<h2>Token exchange failed</h2>"
-                "<p>Please retry the authorization from the chat.</p>",
-                status_code=502)
-
-        td = resp.json()
-        access_token = td.get("access_token", "")
-        scope_str = td.get("scope", "")
-        expires_at = time.time() + td.get("expires_in", 3600) - 60
-
-        # Merge newly granted caps with any existing ones for this chat
-        newly_granted = _caps_from_scopes(scope_str)
-        existing = _get_chat_token(request.app, user_id, chat_id)
-        if existing:
-            merged_caps = existing.get("granted_caps", set()) | newly_granted
-        else:
-            merged_caps = newly_granted
-
-        _token_cache(request.app)[(user_id, chat_id)] = {
-            "access_token": access_token,
-            "expires_at": expires_at,
-            "granted_caps": merged_caps,
-        }
-
-        cap_list = ", ".join(sorted(merged_caps)) if merged_caps else "(none recognized)"
+        previous = _NAMESPACE.set(target)
+        try:
+            granted = await _complete_authorization(request, client_id, client_secret, redirect_uri)
+        except _StateUnavailable:
+            return HTMLResponse("<h2>Authorization state unavailable. Please retry later.</h2>", status_code=503)
+        finally:
+            _NAMESPACE.reset(previous)
+        if isinstance(granted, HTMLResponse):
+            return granted
+        cap_list = ", ".join(sorted(granted)) if granted else "(none recognized)"
         return HTMLResponse(
             "<html><head><style>"
             "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
@@ -329,7 +444,18 @@ def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
             "</div></body></html>"
             "<script>window.close()</script>")
 
-    _insert_route_before_spa(app, CALLBACK_PATH, oauth_callback, methods=["GET"])
+    return oauth_callback
+
+
+def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
+    """Register the single-worker callback. Skip if already current."""
+    version_key = f"__{TOOL_ID}_route_version__"
+    target = _routes_version(client_id, client_secret, base_url)
+    if getattr(app.state, version_key, None) == target:
+        return
+    _strip_tool_routes(app)
+    _insert_route_before_spa(app, CALLBACK_PATH,
+                             _callback_endpoint(client_id, client_secret, base_url), methods=["GET"])
     setattr(app.state, version_key, target)
 
 
@@ -340,6 +466,9 @@ def _ensure_routes(app, client_id: str, client_secret: str, base_url: str):
 
 def _setup(app, valves):
     """Lazy route registration, called once per tool invocation."""
+    app.state.__gws_namespace__ = _routes_version(
+        valves.google_client_id, valves.google_client_secret, valves.base_url)
+    _NAMESPACE.set(app.state.__gws_namespace__)
     if valves.google_client_id and valves.google_client_secret:
         _ensure_routes(
             app, valves.google_client_id,
@@ -351,7 +480,7 @@ def _setup(app, valves):
 # ---------------------------------------------------------------------------
 
 
-def _build_auth_url(
+async def _build_auth_url(
     app, valves, user_id: str, chat_id: str, email: str,
     requested_caps: set,
 ) -> str:
@@ -360,15 +489,18 @@ def _build_auth_url(
     Registers a pending state nonce for the callback.
     """
     state = secrets.token_urlsafe(32)
-    _pending_states(app)[state] = {
+    await _put_pending(app, state, {
         "user_id": user_id,
         "chat_id": chat_id,
-    }
+    })
 
     # Check if user already has some scopes in this chat — if so, use
     # incremental auth to add new ones without re-consenting to old ones.
-    existing = _get_chat_token(app, user_id, chat_id)
+    existing = await _get_chat_token(app, user_id, chat_id)
     has_existing = existing is not None and bool(existing.get("granted_caps"))
+    if has_existing:
+        requested_caps = requested_caps | (
+            existing["granted_caps"] & _parse_caps(valves.enabled_capabilities))
 
     params = {
         "client_id": valves.google_client_id,
@@ -415,7 +547,7 @@ async def _gws_request(
     async with httpx.AsyncClient() as client:
         resp = await client.request(method, url, params=params, json=body, headers=headers)
     if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
+        await _clear_chat_token(app, user_id, chat_id, token)
         return None, "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
     if resp.status_code == 404:
         return None, "NOT_FOUND: The requested resource was not found."
@@ -1158,7 +1290,7 @@ async def _action_calendar_events_delete(token: str, params: dict, app, user_id,
     if resp.status_code == 204:
         return f"EVENT_DELETED: Event {event_id} has been deleted."
     if resp.status_code == 401:
-        _clear_chat_token(app, user_id, chat_id)
+        await _clear_chat_token(app, user_id, chat_id, token)
         return "AUTH_EXPIRED: Token expired. The user must re-authorize for this chat."
     if resp.status_code == 404:
         return f"NOT_FOUND: Event {event_id} was not found."
@@ -1432,6 +1564,7 @@ class Tools:
     # Tool: gws_authorize
     # -------------------------------------------------------------------
 
+    @_state_errors
     async def gws_authorize(
         self,
         capabilities: str = "",
@@ -1457,7 +1590,7 @@ class Tools:
         app = __request__.app
         _setup(app, self.valves)
 
-        if not self.valves.google_client_id:
+        if not self.valves.google_client_id or not self.valves.google_client_secret:
             return "ERROR: Tool not configured. Admin must set OAuth client ID and secret."
 
         if not __chat_id__:
@@ -1474,7 +1607,7 @@ class Tools:
 
         # Empty request → status introspection
         if not requested:
-            existing = _get_chat_token(app, user_id, __chat_id__)
+            existing = await _get_chat_token(app, user_id, __chat_id__)
             granted = sorted(existing.get("granted_caps", set())) if existing else []
             available = sorted(admin_caps)
 
@@ -1497,7 +1630,7 @@ class Tools:
             )
 
         # Check which of the requested caps are already granted in this chat
-        existing = _get_chat_token(app, user_id, __chat_id__)
+        existing = await _get_chat_token(app, user_id, __chat_id__)
         if existing:
             already = existing.get("granted_caps", set())
             needed = requested - already
@@ -1511,7 +1644,7 @@ class Tools:
         else:
             needed = requested
 
-        url = _build_auth_url(
+        url = await _build_auth_url(
             app, self.valves, user_id, __chat_id__, email, needed)
 
         cap_desc = ", ".join(
@@ -1536,7 +1669,7 @@ class Tools:
             })
 
             if result:
-                token = _get_chat_token(app, user_id, __chat_id__)
+                token = await _get_chat_token(app, user_id, __chat_id__)
                 if token and needed <= token.get("granted_caps", set()):
                     all_granted = ", ".join(sorted(token.get("granted_caps", set())))
                     return (
@@ -1550,6 +1683,12 @@ class Tools:
                         f"{time_line}"
                     )
             else:
+                # Cancel only an unconsumed flow. If the callback is exchanging
+                # its code, keep its lease until completion rather than racing it.
+                nonce = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["state"][0]
+                flow = await _pop_pending(app, nonce)
+                if flow:
+                    await _finish_pending(app, nonce, flow)
                 return f"AUTH_CANCELLED: User cancelled authorization.\n{time_line}"
 
         # ------------------------------------------------------------------
@@ -1570,6 +1709,7 @@ class Tools:
     # Tool: gws_action
     # -------------------------------------------------------------------
 
+    @_state_errors
     async def gws_action(
         self,
         action: str,
@@ -1584,7 +1724,7 @@ class Tools:
         app = __request__.app
         _setup(app, self.valves)
 
-        if not self.valves.google_client_id:
+        if not self.valves.google_client_id or not self.valves.google_client_secret:
             return "ERROR: Tool not configured. Admin must set OAuth client ID and secret."
 
         if not __chat_id__:
@@ -1610,7 +1750,7 @@ class Tools:
         user_id = __user__["id"]
 
         # Gate 2: per-chat authorization
-        entry = _get_chat_token(app, user_id, __chat_id__)
+        entry = await _get_chat_token(app, user_id, __chat_id__)
         if not entry or required_cap not in entry.get("granted_caps", set()):
             # Also check if a broader scope covers it (e.g. 'drive' covers 'drive.readonly')
             granted = entry.get("granted_caps", set()) if entry else set()
@@ -1636,6 +1776,8 @@ class Tools:
         # Dispatch to handler
         try:
             return await handler(token, parsed_params, app, user_id, __chat_id__)
+        except _StateUnavailable:
+            raise
         except Exception as e:
             return f"ERROR: {type(e).__name__}: {e}"
 

@@ -1,5 +1,12 @@
 # 🐙 Google Workspace Toolkit for Open WebUI
 
+> **Parked development candidate:** `feature/multiworker-readiness` contains an
+> unreleased `0.8.0-dev` implementation for [issue #7](https://github.com/rndmcnlly/gws-toolkit/issues/7).
+> It is not intended for deployment yet. Memory/Valkey contracts, isolated
+> two-process probes, restart behavior and OWUI toolkit loading have passed;
+> the callback adapter's real OWUI database/cache integration and real Google
+> consent are still unqualified. No current deployment has been switched to it.
+
 Open WebUI tool that gives LLMs authenticated, per-user, per-chat access to Google Workspace APIs through native function calling. Each user authorizes with their own Google account via OAuth2 — no service accounts, no shared credentials. Tokens are ephemeral: every chat starts unauthorized, and access is scoped to exactly the capabilities needed.
 
 **22 actions across 4 services. Reads and writes.** The octopus can search your Drive, read your email, draft replies, create and reschedule calendar events, and read/write spreadsheet data — all gated by admin capability ceilings and per-chat user consent.
@@ -35,13 +42,87 @@ User in chat ──► LLM calls gws_action ──► Dispatcher checks:
 ```
 
 Key properties:
-- **Ephemeral tokens.** No database persistence, no refresh tokens. Tokens live in-process memory keyed by `(user_id, chat_id)` and are lost on server restart. This is by design.
+- **Ephemeral tokens.** No relational-database persistence or refresh tokens. Without Redis, tokens live in process memory and disappear on restart. With OWUI Redis configured, they live there with provider-bounded TTLs and survive worker restarts, not necessarily Redis restarts. Operators control Redis persistence and backups: TTLs alone do not prevent credentials entering snapshots.
 - **Per-chat authorization.** Each chat starts with no access. Users consent to exactly what's needed for that conversation.
-- **Incremental auth.** If a chat needs Drive first and Calendar later, the user consents to each separately. Google's `include_granted_scopes` merges them into one token.
+- **Incremental auth.** New requests include existing, still-admin-enabled scopes. The cached token is labeled only with scopes Google actually returned, never a union of labels from different tokens. One authorization flow per user/chat is allowed at a time, including during token exchange.
 - **Admin capability ceiling.** The `enabled_capabilities` valve determines what's possible. Users can never exceed it.
 - **Time grounding.** Every `gws_authorize` response includes the current server time in UTC, so the LLM knows what "today" means before constructing time-relative API parameters.
 
 The callback endpoint is injected into OWUI's FastAPI routing table before the SPA catch-all mount. See the [route registration pattern](https://gist.github.com/rndmcnlly/740a0238962de750c5fd14e606fe8c90) for details.
+
+## Single-worker and distributed operation (0.8.0 development)
+
+The same toolkit source selects storage automatically:
+
+- `request.app.state.redis is None` (or absent): expiring process-local memory,
+  suitable for one worker in one replica. No extra setup or Redis dependency.
+- An OWUI async Redis client is present: shared expiring state, using that client
+  directly. No separate connection or `open_webui.*` imports in the toolkit.
+  A configured backend failure returns `AUTH_UNAVAILABLE`, never a local-memory
+  fallback. Callback failures return a generic HTTP 503 without credential detail.
+
+Redis must support `GETDEL` (Redis 6.2+ or compatible Valkey) and Lua scripts.
+Atomic state consumption prevents callback replay. Atomic per-chat leases prevent
+concurrent consents overwriting one another. A stale callback cannot overwrite a
+new flow, and a slow 401 for an old token cannot clear a replacement token.
+Pending nonces and leases expire after ten minutes; tokens expire at provider
+expiry minus a sixty-second safety margin. Expired memory entries are reclaimed
+opportunistically. Modal cancellation releases an unconsumed flow;
+denials and failed exchanges release their lease, but require fresh authorization.
+
+Keys follow OWUI's `REDIS_KEY_PREFIX` (default `open-webui`) and a toolkit/config
+namespace. Give unrelated OWUI installations sharing Redis distinct prefixes.
+Replicas of one installation must have identical OAuth valves and prefix. OAuth
+client, secret, public URL or toolkit-version changes invalidate prior state.
+Only synthetic credentials have been used in development tests so far.
+
+### The cold-worker callback problem
+
+OWUI loads toolkits lazily. Registering a route from a tool call does not install
+that route on a worker that has never run the toolkit. **Redis alone is not enough
+for distributed authorization.** Sticky sessions are not a correctness solution.
+
+For distributed operation, `owui_worker.py` supplies a small optional ASGI adapter:
+
+```sh
+# Put owui_worker.py on PYTHONPATH alongside your normal OWUI installation.
+python -m uvicorn owui_worker:create_app --factory --host 0.0.0.0 --port 8080 --workers 2
+```
+
+Use this entrypoint on **every** replica. It forwards OWUI's lifespan, ordinary
+HTTP routes and WebSockets unchanged. Only the fixed GWS callback path is
+intercepted before the SPA. For each callback, it loads current toolkit source
+and valves through OWUI's own database/cache loader, then calls a freshly bound
+callback handler. This works without a prior GWS invocation on that worker and
+does not require storing OAuth credentials in another configuration file. Deleted
+or unconfigured toolkits fail closed. The source includes no model-facing extra
+tools. The toolkit must be installed under the canonical `gws_toolkit` ID.
+
+This adapter uses OWUI internals and must be qualified for your OWUI version.
+It is **not** a native toolkit startup hook or an environment-only switch.
+Preserve your deployment's normal environment, secret key, migration procedure,
+dependency installation and any guarded/custom entrypoint. The command above
+illustrates the ASGI target, not a replacement recipe for BayLeaf's live startup.
+All other OWUI scaling prerequisites (database, WebSockets, config sync, storage
+and vector database) remain the operator's responsibility.
+
+### Development qualification
+
+`tests/test_state.py` runs the same state contract against memory and, when
+`REDIS_URL` is set, real Redis. `tests/test_worker.py` tests callback interception,
+on-demand resolution, configuration changes, error minimization and forwarding.
+
+```sh
+uv run tests/test_state.py
+uv run --with httpx --with fastapi python -m unittest discover -s tests -p test_worker.py
+```
+
+BayLeaf's isolated Docker lab mounts this checkout directly, with no source
+transformation. It exercises two independent processes, synthetic Google/Daytona
+services, actual toolkit methods, Valkey outages, expiry, replay races and worker
+restarts. OWUI's actual loader also accepted the decorated methods/signatures in
+the locally cached v0.12.3 qualification image. This is **not yet full OWUI service
+acceptance, a real Google consent smoke test, or a released version**.
 
 ## Capabilities
 
@@ -182,8 +263,11 @@ Power users can add a system prompt instruction to call `gws_authorize` up front
 - **~1 hour token lifetime.** Access tokens from `access_type=online` expire in about an hour. For long chats, the LLM will see `AUTH_EXPIRED` and re-trigger authorization. This is consistent with the per-chat consent model.
 - **Orphaned routes on tool deletion.** OWUI has no `on_delete` hook, so the callback route persists until server restart.
 - **Single tool ID.** The callback route path is derived from a hardcoded `TOOL_ID`. Deploying two copies of the toolkit under different OWUI tool IDs will cause route collisions. Only one instance should exist per OWUI deployment.
+- **Pending consent.** Another consent request for the same user/chat returns `AUTH_PENDING`. Finish or cancel the existing flow, or wait for its ten-minute lease. Different users and chats remain independent. A callback already exchanging a code is allowed to finish even if the chat modal is cancelled.
 - **No send.** Gmail drafts can be created but not sent. This is deliberate.
 
 ## Files
 
 - `gws_toolkit.py` — the tool (single file, deploy as-is)
+- `owui_worker.py`: optional distributed-callback ASGI entrypoint adapter
+- `tests/`: memory/Redis state contracts and adapter checks
